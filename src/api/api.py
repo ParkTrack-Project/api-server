@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 
 class URL(BaseModel):
@@ -20,6 +21,14 @@ class PublicAPI:
             version=self.version,
             description=self.description
         )
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[
+                "https://parktrack-swagger.nawinds.dev",
+                "https://parktrack-labeler.nawinds.dev"
+            ],
+            allow_credentials=True,
+        )
         self._setup_routes()
 
     def run(self, listen_on: URL):
@@ -35,4 +44,4 @@ class PublicAPI:
         
         @self.app.get("/version")
         def get_version():
-            return {self.version}
+            return {"api_version": self.version}

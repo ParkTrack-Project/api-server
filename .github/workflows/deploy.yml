@@ -1,0 +1,42 @@
+name: Deploy to server
+
+on:
+  push:
+    branches: [ main, deploy-workflow ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.SERVER_IP }}" >> ~/.ssh/known_hosts
+
+      - name: Upload entire repository (preserve venv on server)
+        run: |
+          rsync -az --delete \
+            --exclude='venv/' \
+            -e "ssh -o StrictHostKeyChecking=yes" \
+            ./ \
+            "${{ secrets.USERNAME }}@${{ secrets.SERVER_IP }}:${{ secrets.PROJECT_PATH }}/"
+
+      - name: Install deps and restart service on server
+        run: |
+          ssh -T -o StrictHostKeyChecking=yes \
+            "${{ secrets.USERNAME }}@${{ secrets.SERVER_IP }}" <<'EOF' > /dev/null
+          set -euo pipefail
+          cd "${{ secrets.PROJECT_PATH }}"
+          # Activate existing venv and install/upgrade deps
+          source "${{ secrets.PROJECT_PATH }}/venv/bin/activate"
+          pip3 install --upgrade pip
+          pip3 install -r requirements.txt
+          # Restart your service
+          sudo systemctl restart parktrack-api-server
+          EOF

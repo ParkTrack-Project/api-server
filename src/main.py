@@ -3,7 +3,7 @@ from db_manager.db_manager import DBManager
 
 def main():
     api_server = PublicAPI(db_manager=DBManager("mock"))
-    api_server.run(URL(host="0.0.0.0", port=8000))
+    api_server.run(URL(host="127.0.0.1", port=8000))
 
 if __name__ == "__main__":
     main()

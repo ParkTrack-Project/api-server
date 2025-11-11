@@ -9,12 +9,11 @@ class URL(BaseModel):
 
 class PublicAPI:
     title = "API Server"
-    version = "0.0.1"
+    version = "0.1.0"
     description="ParkTrack server API built with FastAPI"
 
     def __init__(self, db_manager):
         self.db_manager = db_manager
-        self.db_manager.connect()
 
         self.app = FastAPI(
             title=self.title,

@@ -21,7 +21,7 @@ class CreateCamera(BaseModel):
     
     @field_validator('longitude')
     @classmethod
-    def validate_latitude(cls, longitude):
+    def validate_longitude(cls, longitude):
         if longitude > 90 or longitude < -90:
             raise ValueError("Invalid longitude value")
         return longitude

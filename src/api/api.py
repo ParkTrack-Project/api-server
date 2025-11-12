@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -48,4 +48,28 @@ class PublicAPI:
         
         @self.app.post("/cameras/new")
         def create_new_camera(new_camera: CreateCamera):
-            return {"Test"}
+            try:
+                if self.db_manager.camera_already_exists(new_camera.title):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Camera with title '{new_camera.title}' already exists"
+                    )
+                
+                camera_id = self.db_manager.create_camera({
+                    "title": new_camera.title,
+                    "latitude": new_camera.latitude,
+                    "longitude": new_camera.longitude
+                })
+                
+                return {
+                    "status": "success",
+                    "message": "Camera created successfully",
+                    "camera_id": camera_id
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )

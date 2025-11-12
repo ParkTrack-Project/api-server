@@ -119,7 +119,7 @@ class DBManager:
         
     def camera_already_exists(self, title) -> bool:
         with self.get_session() as session:
-            return session.query(Camera).filter(Camera.title.ilike(title)).first is not None
+            return len(session.query(Camera).filter(Camera.title.ilike(title))) == 0
         
     def create_camera(self, camera):
         with self.get_session() as session:

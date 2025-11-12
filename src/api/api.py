@@ -2,9 +2,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
+from models import CreateCamera
 
 class URL(BaseModel):
-    port: int
+    port: str
     host: str
 
 class PublicAPI:
@@ -44,3 +45,7 @@ class PublicAPI:
         @self.app.get("/version")
         def get_version():
             return {"api_version": self.version}
+        
+        @self.app.post("/cameras/new")
+        def create_new_camera(new_camera: CreateCamera):
+            return {"Test"}

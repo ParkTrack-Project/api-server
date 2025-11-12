@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
@@ -103,7 +103,7 @@ class DBManager:
         try:
             with self.get_session() as session:
                 # Простой запрос для проверки соединения
-                session.execute("SELECT 1")
+                session.execute(text("SELECT 1"))
             return True
         except SQLAlchemyError as e:
             print(f"Database connection check failed: {e}")

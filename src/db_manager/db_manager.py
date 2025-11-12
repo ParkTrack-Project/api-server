@@ -5,7 +5,7 @@ import contextlib
 from typing import Generator, Optional
 import os
 
-from .models import Base
+from .models import Base, Camera
 
 class DBManager:
     def __init__(self, database_url: Optional[str] = None):
@@ -116,3 +116,21 @@ class DBManager:
         with self.get_session() as session:
             result = session.execute(query, params or {})
             return result
+        
+    def camera_already_exists(self, title) -> bool:
+        with self.get_session() as session:
+            return session.query(Camera).filter(Camera.title.ilike(title)).first is not None
+        
+    def create_camera(self, camera):
+        with self.get_session() as session:
+            new_camera = Camera(
+                title=camera['title'],
+                latitude=camera['latitude'],
+                longitude=camera['longitude']
+            )
+
+            session.add(new_camera)
+
+            session.flush()
+
+            return new_camera.id

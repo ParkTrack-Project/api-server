@@ -102,7 +102,6 @@ class DBManager:
         """Проверить соединение с базой данных"""
         try:
             with self.get_session() as session:
-                # Простой запрос для проверки соединения
                 session.execute(text("SELECT 1"))
             return True
         except SQLAlchemyError as e:

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from models import CreateCamera
+from .models import CreateCamera
 
 class URL(BaseModel):
     port: str

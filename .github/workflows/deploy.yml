@@ -40,3 +40,99 @@ jobs:
           # Restart your service
           sudo systemctl restart parktrack-api-server
           EOF
+  check-service:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.SERVER_IP }}" >> ~/.ssh/known_hosts
+
+      - name: Wait and check service health (systemd + summary)
+        run: |
+          echo "Checking systemd status on remote server..."
+
+          SSH="ssh -T -o StrictHostKeyChecking=yes ${{ secrets.USERNAME }}@${{ secrets.SERVER_IP }}"
+          APP_ROOT="${{ secrets.PROJECT_PATH }}"
+
+          if $SSH "sleep 5 && systemctl is-active --quiet parktrack-api-server" > /dev/null 2>&1; then
+            echo "systemd reports parktrack-api-server=active."
+          else
+            echo "Service is NOT active. Fetching logs since last start..."
+
+            # Время последнего запуска юнита
+            START_TIME=$($SSH "systemctl show parktrack-api-server -p ActiveEnterTimestamp --value" || echo "unknown")
+
+            # Логи только с последнего запуска + маскировка пути
+            ERROR_LOG=$(
+              $SSH "journalctl -u parktrack-api-server --since \"$START_TIME\" --no-pager --no-hostname -o short" \
+                | sed "s|$APP_ROOT|<project_path>|g" \
+                | tail -n 20
+            )
+
+            echo "Last start time: $START_TIME"
+            echo "Last error log lines:"
+            echo "$ERROR_LOG"
+
+            # Красивый markdown в summary
+            {
+              echo "## ❌ Service restart failed"
+              echo
+              echo "**Last start:** \`$START_TIME\`"
+              echo
+              echo "### Logs since last start:"
+              echo
+              echo '```text'
+              echo "$ERROR_LOG"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit 1
+          fi
+
+  check-health-endpoint:
+    runs-on: ubuntu-latest
+    needs: [build-and-deploy, check-service]
+
+    steps:
+      - name: Wait and check /health endpoint
+        run: |
+          echo "Waiting for health endpoint to become healthy..."
+
+          URL="https://parktrack-api.nawinds.dev/health"
+          RESPONSE=""
+          SUCCESS=0
+
+          for i in {1..5}; do
+            RESPONSE=$(curl -sS "$URL" || echo "")
+            echo "Attempt $i, response: $RESPONSE"
+
+            if [ "$RESPONSE" = '{"status":"healthy"}' ]; then
+              SUCCESS=1
+              break
+            fi
+
+            sleep 3
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            {
+              echo "## ❌ Healthcheck failed"
+              echo
+              echo "**Endpoint:** \`$URL\`  "
+              echo
+              echo "### Last response"
+              echo
+              echo '```json'
+              echo "$RESPONSE"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit 1
+          fi
+
+          echo "Health endpoint OK."

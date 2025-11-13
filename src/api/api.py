@@ -27,6 +27,8 @@ class PublicAPI:
                 "https://parktrack-swagger.nawinds.dev",
                 "https://parktrack-labeler.nawinds.dev"
             ],
+            allow_methods=["*"],
+            allow_headers=["*"],
             allow_credentials=True,
         )
         self._setup_routes()

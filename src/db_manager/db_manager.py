@@ -17,10 +17,11 @@ class DBManager:
     def _get_default_database_url(self) -> str:
         """Захардкодил URL базы данных по умолчанию"""
         # Для SQLite
-        return "sqlite:///./parktrack.db"
+        # return "sqlite:///./parktrack.db"
         
         # Для PostgreSQL:
         # return "postgresql://user:password@localhost/parktrack"
+        return os.getenv("DB_CONNECTION_URL")
 
     def _initialize_database(self):
         """Инициализация движка и сессии"""

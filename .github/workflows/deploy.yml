@@ -103,7 +103,7 @@ jobs:
         run: |
           echo "Waiting for health endpoint to become healthy..."
 
-          URL="https://parktrack-api.nawinds.dev/health"
+          URL="https://api.parktrack.live/health"
           RESPONSE=""
           SUCCESS=0
 

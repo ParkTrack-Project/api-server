@@ -24,8 +24,8 @@ class PublicAPI:
         self.app.add_middleware(
             CORSMiddleware,
             allow_origins=[
-                "https://parktrack-swagger.nawinds.dev",
-                "https://parktrack-labeler.nawinds.dev"
+                "https://swagger.parktrack.live",
+                "https://labeler.parktrack.live"
             ],
             allow_methods=["*"],
             allow_headers=["*"],

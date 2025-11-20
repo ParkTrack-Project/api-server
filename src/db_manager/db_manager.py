@@ -1,11 +1,10 @@
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
 from typing import Generator, Optional
-import os
 
-from .models import Base, Camera
+from .models import Base, Camera, ParkingZone, ParkingZonePoint
 
 class DBManager:
     def __init__(self, database_url: Optional[str] = None):
@@ -118,16 +117,28 @@ class DBManager:
             result = session.execute(query, params or {})
             return result
         
-    def camera_already_exists(self, title) -> bool:
+    def camera_title_already_exists(self, title) -> bool:
         with self.get_session() as session:
-            return len(session.query(Camera).filter(Camera.title.ilike(title))) == 0
+            query_result = session.query(Camera).filter(Camera.title.ilike(title))
+
+            return session.query(query_result.exists()).scalar()
+        
+    def camera_id_exists(self, id) -> bool:
+        with self.get_session() as session:
+            query_result = session.query(Camera).filter(Camera.id == id)
+
+            return session.query(query_result.exists()).scalar()
         
     def create_camera(self, camera):
         with self.get_session() as session:
             new_camera = Camera(
                 title=camera['title'],
                 latitude=camera['latitude'],
-                longitude=camera['longitude']
+                longitude=camera['longitude'],
+                source=camera['source'],
+                image_height=camera['image_height'],
+                image_width=camera['image_width'],
+                calib=camera['calib']
             )
 
             session.add(new_camera)
@@ -135,3 +146,55 @@ class DBManager:
             session.flush()
 
             return new_camera.id
+        
+    def create_zone(self, zone):
+        with self.get_session() as session:
+            new_zone = ParkingZone(
+                zone_type=zone['zone_type'],
+                parking_lots_count=zone['parking_lots_count'],
+                camera_id=zone['camera_id']
+            )
+
+            session.add(new_zone)
+
+            session.flush()
+
+            session.add_all([
+                ParkingZonePoint(
+                    parking_zone_id=new_zone.id, 
+                    x=point.x,
+                    y=point.y,
+                    latitude=point.latitude,
+                    longitude=point.longitude)
+                for point in zone['points']
+            ])
+
+            session.flush()
+
+            return new_zone.id
+        
+    def get_zone(self, zone_id: int, with_points=False):
+        with self.get_session() as session:
+            query = session.query(ParkingZone)
+
+            if with_points:
+                query = query.options(joinedload(ParkingZone.points))
+
+            zone = query.filter(ParkingZone.id == zone_id).one_or_none()
+
+            return zone.serialize() if zone is not None else zone
+    
+    def get_all_zones(self, camera_id, min_free_count, max_pay):
+        with self.get_session() as session:
+            query = session.query(ParkingZone).options(joinedload(ParkingZone.points))
+
+            if camera_id is not None:
+                query = query.filter(ParkingZone.camera_id == camera_id)
+            
+            if min_free_count is not None and min_free_count > 0:
+                query = query.filter(ParkingZone.parking_lots_count - ParkingZone.occupied >= min_free_count)
+
+            if max_pay is not None:
+                query = query.filter(ParkingZone.pay <= max_pay)
+
+            return [zone.serialize() for zone in query.all()]

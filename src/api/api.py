@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import CreateCamera
+from .models import CreateCamera, CreateZone
 
 class URL(BaseModel):
     port: str
@@ -12,6 +12,9 @@ class PublicAPI:
     title = "API Server"
     version = "0.1.0"
     description="ParkTrack server API built with FastAPI"
+
+    # Обязательно подключу когда-нибудь
+    # valid_tokens = set() 
 
     def __init__(self, db_manager):
         self.db_manager = db_manager
@@ -51,7 +54,7 @@ class PublicAPI:
         @self.app.post("/cameras/new")
         def create_new_camera(new_camera: CreateCamera):
             try:
-                if self.db_manager.camera_already_exists(new_camera.title):
+                if self.db_manager.camera_title_already_exists(new_camera.title):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail=f"Camera with title '{new_camera.title}' already exists"
@@ -60,7 +63,11 @@ class PublicAPI:
                 camera_id = self.db_manager.create_camera({
                     "title": new_camera.title,
                     "latitude": new_camera.latitude,
-                    "longitude": new_camera.longitude
+                    "longitude": new_camera.longitude,
+                    "source": new_camera.source,
+                    "image_width": new_camera.image_width,
+                    "image_height": new_camera.image_height,
+                    "calib": new_camera.calib
                 })
                 
                 return {
@@ -68,6 +75,73 @@ class PublicAPI:
                     "message": "Camera created successfully",
                     "camera_id": camera_id
                 }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
+
+        @self.app.post('/zones/new')
+        def create_new_zone(new_zone: CreateZone):
+            try:
+                if not self.db_manager.camera_id_exists(new_zone.camera_id):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Camera with id {new_zone.camera_id} doesn't exist"
+                    )
+                
+                zone_id = self.db_manager.create_zone({
+                    "zone_type": new_zone.zone_type,
+                    "parking_lots_count": new_zone.capacity,
+                    "camera_id": new_zone.camera_id,
+                    "pay": new_zone.pay,
+                    "points": new_zone.points
+                })
+
+                return {
+                    "zone_id": zone_id
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
+        
+        @self.app.get("/zones/{zone_id}")
+        def get_zone(zone_id: int):
+            try:
+                zone = self.db_manager.get_zone(zone_id)
+
+                if zone is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Zone with id {zone_id} doesn't exist"
+                    )
+                
+                return zone
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
+            
+        @self.app.get("/zones")
+        def get_zones(
+            camera_id: int = None, 
+            min_free_count: int = None, 
+            max_pay: int = None):
+            try:
+                zones = self.db_manager.get_all_zones(camera_id, min_free_count, max_pay)
+                
+                return zones
+
             except HTTPException:
                 raise
             except Exception as e:

@@ -45,16 +45,16 @@ class PublicAPI:
     def _setup_routes(self):
 
         @self.app.get("/health")
-        def get_health():
+        async def get_health():
             db_ok = self.db_manager.check_connection()
             return {"status": "healthy" if db_ok else "degraded"}
         
         @self.app.get("/version")
-        def get_version():
+        async def get_version():
             return {"api_version": self.version}
         
         @self.app.post("/cameras/new")
-        def create_new_camera(new_camera: CreateCamera):
+        async def create_new_camera(new_camera: CreateCamera):
             try:
                 if self.db_manager.camera_title_already_exists(new_camera.title):
                     raise HTTPException(
@@ -86,7 +86,7 @@ class PublicAPI:
                 )
 
         @self.app.post('/zones/new')
-        def create_new_zone(new_zone: CreateZone):
+        async def create_new_zone(new_zone: CreateZone):
             try:
                 if not self.db_manager.camera_id_exists(new_zone.camera_id):
                     raise HTTPException(
@@ -114,7 +114,7 @@ class PublicAPI:
                 )
         
         @self.app.get("/zones/{zone_id}")
-        def get_zone(zone_id: int):
+        async def get_zone(zone_id: int):
             try:
                 zone = self.db_manager.get_zone(zone_id)
 
@@ -135,7 +135,7 @@ class PublicAPI:
                 )
             
         @self.app.get("/zones")
-        def get_zones(
+        async def get_zones(
             camera_id: int = None, 
             min_free_count: int = None, 
             max_pay: int = None):
@@ -153,7 +153,7 @@ class PublicAPI:
                 )
             
         @self.app.get("/cameras")
-        def get_cameras(
+        async def get_cameras(
             q: str = None, 
             top_left_corner_latitude: float = None, 
             top_left_corner_longitude: float = None,
@@ -178,7 +178,7 @@ class PublicAPI:
                 )
             
         @self.app.get("/cameras/next")
-        def get_next_camera():
+        async def get_next_camera():
             try:
                 camera = self.db_manager.get_most_outdated_camera()
                 
@@ -193,7 +193,7 @@ class PublicAPI:
                 )
             
         @self.app.get("/cameras/{camera_id}")
-        def get_camera(camera_id: int):
+        async def get_camera(camera_id: int):
             try:
                 camera = self.db_manager.get_camera(camera_id)
                 
@@ -208,8 +208,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/cameras/{camera_id}")
-        def update_camera(camera_id: int, updated_fields: dict):
+        async def update_camera(camera_id: int, updated_fields: Request):
             try:
+                updated_fields = await updated_fields.json()
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 return camera
@@ -223,8 +224,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/zones/{zone_id}")
-        def update_zone(zone_id: int, updated_fields: dict):
+        async def update_zone(zone_id: int, updated_fields: dict):
             try:
+                updated_fields = await updated_fields.json()
                 zone = self.db_manager.update_zone(zone_id, updated_fields)
                 
                 return zone

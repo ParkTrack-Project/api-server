@@ -224,7 +224,7 @@ class PublicAPI:
                 )
             
         @self.app.put("/zones/{zone_id}")
-        async def update_zone(zone_id: int, updated_fields: dict):
+        async def update_zone(zone_id: int, updated_fields: Request):
             try:
                 updated_fields = await updated_fields.json()
                 zone = self.db_manager.update_zone(zone_id, updated_fields)

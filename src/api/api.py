@@ -205,7 +205,7 @@ class PublicAPI:
                     detail=f"Internal server error: {str(e)}"
                 )
             
-        @self.app.put("cameras/{camera_id}")
+        @self.app.put("/cameras/{camera_id}")
         def update_camera(camera_id: int, updated_fields: UpdateCamera):
             try:
                 camera = self.db_manager.update_camera(camera_id, updated_fields)

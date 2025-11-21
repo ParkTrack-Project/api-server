@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, inspect, text, func
+from sqlalchemy import create_engine, inspect, text, func, update
 from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
@@ -250,3 +250,20 @@ class DBManager:
             self._next_camera()
 
             return camera.serialize() if camera is not None else {}
+        
+    def get_camera(self, camera_id):
+        with self.get_session() as session:
+            camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
+
+            return camera.serialize()
+
+    def update_camera(self, camera_id, updated_fields):
+        with self.get_session() as session:
+            stmt = update(Camera).where(Camera.id == camera_id)
+            update_data = updated_fields.model_dump(exclude_none=True)
+
+            stmt = stmt.values(**update_data)
+            
+            session.execute(stmt)
+
+            return self.get_camera(camera_id)

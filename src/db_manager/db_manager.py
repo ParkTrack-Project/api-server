@@ -264,6 +264,8 @@ class DBManager:
 
             stmt = stmt.values(**update_data)
             
+            print(update_data)
+
             session.execute(stmt)
 
             session.commit()

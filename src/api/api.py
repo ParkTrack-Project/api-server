@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import CreateCamera, CreateZone, UpdateCamera, UpdateZone
+
+import json
 
 class URL(BaseModel):
     port: str
@@ -206,9 +208,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/cameras/{camera_id}")
-        def update_camera(camera_id: int, updated_fields):
+        def update_camera(camera_id: int, updated_fields: Request):
             try:
-                camera = self.db_manager.update_camera(camera_id, updated_fields)
+                camera = self.db_manager.update_camera(camera_id, updated_fields.json())
                 
                 return camera
 
@@ -221,9 +223,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/zones/{zone_id}")
-        def update_zone(zone_id: int, updated_fields):
+        def update_zone(zone_id: int, updated_fields: Request):
             try:
-                zone = self.db_manager.update_zone(zone_id, updated_fields)
+                zone = self.db_manager.update_zone(zone_id, updated_fields.json())
                 
                 return zone
 

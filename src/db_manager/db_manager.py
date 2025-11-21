@@ -260,11 +260,10 @@ class DBManager:
     def update_camera(self, camera_id, updated_fields):
         with self.get_session() as session:
             stmt = update(Camera).where(Camera.id == camera_id)
-            update_data = updated_fields.model_dump(exclude_none=True)
 
-            stmt = stmt.values(**update_data)
+            stmt = stmt.values(updated_fields)
             
-            print(update_data)
+            print(updated_fields)
 
             session.execute(stmt)
 
@@ -277,9 +276,8 @@ class DBManager:
     def update_zone(self, zone_id, updated_fields):
         with self.get_session() as session:
             stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
-            update_data = updated_fields.model_dump(exclude_none=True)
 
-            stmt = stmt.values(**update_data)
+            stmt = stmt.values(updated_fields)
             
             session.execute(stmt)
 

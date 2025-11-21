@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, asc
 from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
@@ -226,3 +226,7 @@ class DBManager:
                 query = query.filter(Camera.longitude >= bottom_right_corner_longitude)
 
             return [camera.serialize() for camera in query.all()]
+
+    def get_most_outdated_camera(self):
+        with self.get_session() as session:
+            return session.query(Camera).filter(Camera.is_active == True).order_by(Camera.updated_at.asc()).first().serialize()

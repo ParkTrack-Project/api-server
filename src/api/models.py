@@ -61,6 +61,72 @@ class CreateCamera(BaseModel):
                 raise ValueError(f"Invalid calibration data: {e}")
         return calib
     
+class UpdateCamera(BaseModel):
+    title: str = None
+    source: str = None
+    image_width: int = None
+    image_height: int = None
+    calib: Any = None
+    latitude: float = None
+    longitude: float = None
+    
+    @field_validator('title')
+    @classmethod
+    def validate_title(cls, title):
+        if not title: return
+        if len(title) < 1 or len(title) > 200:
+            raise ValueError(f"Invalid camera title: {title}")
+        return title
+
+    @field_validator('source')
+    @classmethod
+    def validate_source(cls, source):
+        if not source: return
+        return source
+    
+    @field_validator('latitude')
+    @classmethod
+    def validate_latitude(cls, latitude):
+        if not latitude: return
+        if latitude > 90 or latitude < -90:
+            raise ValueError(f"Invalid latitude value: {latitude}")
+        return latitude
+    
+    @field_validator('longitude')
+    @classmethod
+    def validate_longitude(cls, longitude):
+        if not longitude: return
+        if longitude > 180 or longitude < -180:
+            raise ValueError(f"Invalid longitude value: {longitude}")
+        return longitude
+    
+    @field_validator('image_width')
+    @classmethod
+    def validate_image_width(cls, image_width):
+        if not image_width: return
+        if image_width <= 0: 
+            raise ValueError(f"Invalid image_width value: {image_width}")
+        return image_width
+    
+    @field_validator('image_height')
+    @classmethod
+    def validate_image_height(cls, image_height):
+        if not image_height: return
+        if image_height <= 0: 
+            raise ValueError(f"Invalid image_height value: {image_height}")
+        return image_height
+    
+    @field_validator('calib')
+    @classmethod
+    def validate_calib(cls, calib):
+        if calib is not None:
+            try:
+                json.dumps(calib)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Invalid calibration data: {e}")
+        return calib
+
+
 class Point(BaseModel):
     latitude: float
     longitude: float

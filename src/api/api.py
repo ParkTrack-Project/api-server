@@ -174,3 +174,18 @@ class PublicAPI:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Internal server error: {str(e)}"
                 )
+            
+        @self.app.get("/cameras/next")
+        def get_next_camera():
+            try:
+                camera = self.db_manager.get_most_outdated_camera()
+                
+                return camera
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )

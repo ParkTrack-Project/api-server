@@ -28,7 +28,7 @@ class Camera(Base):
     
     def serialize(self):
         return {
-        "id": self.id,
+        "camera_id": self.id,
         "title": self.title,
         "is_active": self.is_active,
         "source": self.source,
@@ -39,6 +39,15 @@ class Camera(Base):
         "longitude": self.longitude,
         "created_at": self.created_at.isoformat() if self.created_at else None,
         "updated_at": self.updated_at.isoformat() if self.updated_at else None
+    }
+
+    def serialize_metadata_only(self):
+        return {
+        "camera_id": self.id,
+        "source": self.source,
+        "image_height": self.image_height,
+        "image_width": self.image_width,
+        "calib": self.calib
     }
 
 class ParkingZone(Base):

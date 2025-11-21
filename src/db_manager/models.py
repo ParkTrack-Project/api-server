@@ -62,7 +62,7 @@ class ParkingZone(Base):
     pay = Column(Integer)
     occupancy_updated_at = Column(DateTime, default=None)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     camera = relationship("Camera", back_populates="parking_zones")
     points = relationship("ParkingZonePoint", back_populates="parking_zone")

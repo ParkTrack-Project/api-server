@@ -5,7 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import contextlib
 from typing import Generator, Optional
 
-from .models import Base, Camera, ParkingZone, ParkingZonePoint
+from .models import Base, Camera, ParkingZone, ParkingZonePoint, datetime, timezone
 
 class DBManager:
     def __init__(self, database_url: str):
@@ -262,7 +262,6 @@ class DBManager:
             stmt = update(Camera).where(Camera.id == camera_id)
 
             stmt = stmt.values(updated_fields)
-            
             print(updated_fields)
 
             session.execute(stmt)
@@ -277,7 +276,10 @@ class DBManager:
         with self.get_session() as session:
             stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
 
-            stmt = stmt.values(updated_fields)
+            stmt = stmt.values(
+                updated_fields | {"updated_at": datetime.now(timezone.utc)}
+                    if "occupied" not in updated_fields else 
+                updated_fields | {"occupancy_updated_at": datetime.now(timezone.utc)})
             
             session.execute(stmt)
 

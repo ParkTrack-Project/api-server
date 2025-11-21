@@ -10,7 +10,7 @@ class Camera(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(120))
-    is_active = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
     source = Column(String(250))
     image_height = Column(Integer, default=0)
     image_width = Column(Integer, default=0)

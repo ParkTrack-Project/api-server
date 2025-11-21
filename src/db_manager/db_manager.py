@@ -266,4 +266,4 @@ class DBManager:
             
             session.execute(stmt)
 
-            return self.get_camera(camera_id)
+            return self.get_camera(camera_id).serialize()

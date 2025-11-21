@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, status, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import CreateCamera, CreateZone, UpdateCamera, UpdateZone
+from .models import CreateCamera, CreateZone
 
 import json
 

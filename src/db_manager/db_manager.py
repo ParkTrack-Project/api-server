@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, inspect, text, asc
+from sqlalchemy import create_engine, inspect, text, func
 from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
@@ -14,6 +14,9 @@ class DBManager:
         self.SessionLocal = None
         self._initialize_database()
 
+        self.total_camera_count = None
+        self.camera_index = 1
+
     # def _get_default_database_url(self) -> str:
     #     """Захардкодил URL базы данных по умолчанию"""
     #     # Для SQLite
@@ -22,6 +25,19 @@ class DBManager:
     #     # Для PostgreSQL:
     #     # return "postgresql://user:password@localhost/parktrack"
     #     return os.getenv("DB_CONNECTION_URL")
+
+    def _get_total_camera_count(self):
+        if not self.total_camera_count: 
+            with self.get_session() as session:
+                self.total_camera_count = session.query(func.count(Camera.id)).scalar()
+
+        return self.total_camera_count
+    
+    def _next_camera(self):
+        if self.camera_index == self._get_total_camera_count():
+            self.camera_index = 1
+        else:
+            self.camera_index += 1
 
     def _initialize_database(self):
         """Инициализация движка и сессии"""
@@ -227,6 +243,10 @@ class DBManager:
 
             return [camera.serialize() for camera in query.all()]
 
-    def get_most_outdated_camera(self):
+    def get_most_outdated_camera(self, limit: int = 1):
         with self.get_session() as session:
-            return session.query(Camera).filter(Camera.is_active == True).order_by(Camera.updated_at.asc()).first().serialize()
+            camera = session.query(Camera).filter(Camera.id == self.camera_index).one_or_none()
+
+            self._next_camera()
+
+            return camera.serialize() if camera is not None else {}

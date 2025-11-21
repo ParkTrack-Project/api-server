@@ -266,4 +266,6 @@ class DBManager:
             
             session.execute(stmt)
 
-            return self.get_camera(camera_id).serialize()
+            camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
+
+            return camera.serialize()

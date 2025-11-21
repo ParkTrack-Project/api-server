@@ -266,6 +266,8 @@ class DBManager:
             
             session.execute(stmt)
 
+            session.commit()
+
             camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
 
             return camera.serialize()
@@ -278,6 +280,8 @@ class DBManager:
             stmt = stmt.values(**update_data)
             
             session.execute(stmt)
+
+            session.commit()
 
             zone = session.query(ParkingZone).filter(ParkingZone.id == zone_id).one_or_none()
 

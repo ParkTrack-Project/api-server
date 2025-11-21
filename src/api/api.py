@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import CreateCamera, CreateZone, UpdateCamera
+from .models import CreateCamera, CreateZone, UpdateCamera, UpdateZone
 
 class URL(BaseModel):
     port: str
@@ -211,6 +211,21 @@ class PublicAPI:
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 return camera
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
+            
+        @self.app.put("/zones/{zone_id}")
+        def update_zone(zone_id: int, updated_fields: UpdateZone):
+            try:
+                zone = self.db_manager.update_zone(zone_id, updated_fields)
+                
+                return zone
 
             except HTTPException:
                 raise

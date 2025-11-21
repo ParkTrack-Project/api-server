@@ -219,3 +219,60 @@ class CreateZone(BaseModel):
                     raise ValueError(f"Degenerate rectangle")
         
         return points
+    
+class UpdateZone(BaseModel):
+    camera_id: int = None
+    zone_type: str = None
+    capacity: int = None
+    pay: int = None
+    points: List[Point] = None
+
+    @field_validator('camera_id')
+    @classmethod
+    def validate_camera_id(cls, camera_id):
+        if not camera_id: return
+        if camera_id <= 0:
+            raise ValueError(f"Invalid camera_id value: {camera_id}")
+        
+        return camera_id
+
+    @field_validator('zone_type')
+    @classmethod
+    def validate_zone_type(cls, zone_type):
+        if not zone_type: return
+        if zone_type not in ['parallel', 'standard']:
+            raise ValueError(f"Invalid zone_type value: {zone_type}")
+        
+        return zone_type
+
+    @field_validator('capacity')
+    @classmethod
+    def validate_capacity(cls, capacity):
+        if not capacity: return
+        if capacity <= 0:
+            raise ValueError(f"Invalid capacity value: {capacity}")
+        
+        return capacity
+        
+    @field_validator('pay')
+    @classmethod
+    def validate_pay(cls, pay):
+        if not pay: return
+        if pay < 0:
+            raise ValueError(f"Invalid pay value: {pay}")
+        
+        return pay
+
+    @field_validator('points')
+    @classmethod
+    def validate_points(cls, points):
+        if not points: return
+        if len(points) != 4:
+            raise ValueError(f"Invalid points count: {len(points)}")
+        
+        for lhs in range(0, len(points)):
+            for rhs in range(lhs + 1, len(points)):
+                if points[lhs] == points[rhs]:
+                    raise ValueError(f"Degenerate rectangle")
+        
+        return points

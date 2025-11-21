@@ -269,3 +269,16 @@ class DBManager:
             camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
 
             return camera.serialize()
+        
+    def update_zone(self, zone_id, updated_fields):
+        with self.get_session() as session:
+            stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
+            update_data = updated_fields.model_dump(exclude_none=True)
+
+            stmt = stmt.values(**update_data)
+            
+            session.execute(stmt)
+
+            zone = session.query(ParkingZone).filter(ParkingZone.id == zone_id).one_or_none()
+
+            return zone.serialize()

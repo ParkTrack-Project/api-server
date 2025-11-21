@@ -149,3 +149,28 @@ class PublicAPI:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Internal server error: {str(e)}"
                 )
+            
+        @self.app.get("/cameras")
+        def get_cameras(
+            q: str = None, 
+            top_left_corner_latitude: float = None, 
+            top_left_corner_longitude: float = None,
+            bottom_right_corner_latitude: float = None,
+            bottom_right_corner_longitude: float = None):
+            try:
+                zones = self.db_manager.get_all_cameras(
+                    q, 
+                    top_left_corner_latitude,
+                    top_left_corner_longitude,
+                    bottom_right_corner_latitude,
+                    bottom_right_corner_longitude)
+                
+                return zones
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )

@@ -208,9 +208,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/cameras/{camera_id}")
-        def update_camera(camera_id: int, updated_fields: Request):
+        def update_camera(camera_id: int, updated_fields: dict):
             try:
-                camera = self.db_manager.update_camera(camera_id, updated_fields.json())
+                camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 return camera
 
@@ -223,9 +223,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/zones/{zone_id}")
-        def update_zone(zone_id: int, updated_fields: Request):
+        def update_zone(zone_id: int, updated_fields: dict):
             try:
-                zone = self.db_manager.update_zone(zone_id, updated_fields.json())
+                zone = self.db_manager.update_zone(zone_id, updated_fields)
                 
                 return zone
 

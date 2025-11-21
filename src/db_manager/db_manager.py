@@ -8,20 +8,20 @@ from typing import Generator, Optional
 from .models import Base, Camera, ParkingZone, ParkingZonePoint
 
 class DBManager:
-    def __init__(self, database_url: Optional[str] = None):
-        self.database_url = database_url or self._get_default_database_url()
+    def __init__(self, database_url: str):
+        self.database_url = database_url
         self.engine = None
         self.SessionLocal = None
         self._initialize_database()
 
-    def _get_default_database_url(self) -> str:
-        """Захардкодил URL базы данных по умолчанию"""
-        # Для SQLite
-        # return "sqlite:///./parktrack.db"
+    # def _get_default_database_url(self) -> str:
+    #     """Захардкодил URL базы данных по умолчанию"""
+    #     # Для SQLite
+    #     # return "sqlite:///./parktrack.db"
         
-        # Для PostgreSQL:
-        # return "postgresql://user:password@localhost/parktrack"
-        return os.getenv("DB_CONNECTION_URL")
+    #     # Для PostgreSQL:
+    #     # return "postgresql://user:password@localhost/parktrack"
+    #     return os.getenv("DB_CONNECTION_URL")
 
     def _initialize_database(self):
         """Инициализация движка и сессии"""
@@ -199,3 +199,30 @@ class DBManager:
                 query = query.filter(ParkingZone.pay <= max_pay)
 
             return [zone.serialize() for zone in query.all()]
+        
+    def get_all_cameras(
+            self, 
+            q, 
+            top_left_corner_latitude, 
+            top_left_corner_longitude, 
+            bottom_right_corner_latitude, 
+            bottom_right_corner_longitude):
+        with self.get_session() as session:
+            query = session.query(Camera)
+
+            if q is not None:
+                query = query.filter(Camera.title.icontains(q))
+            
+            if top_left_corner_latitude is not None:
+                query = query.filter(Camera.latitude <= top_left_corner_latitude)
+
+            if top_left_corner_longitude is not None:
+                query = query.filter(Camera.longitude >= top_left_corner_longitude)
+
+            if bottom_right_corner_latitude is not None:
+                query = query.filter(Camera.latitude >= bottom_right_corner_latitude)
+
+            if bottom_right_corner_longitude is not None:
+                query = query.filter(Camera.longitude >= bottom_right_corner_longitude)
+
+            return [camera.serialize() for camera in query.all()]

@@ -169,7 +169,8 @@ class DBManager:
             new_zone = ParkingZone(
                 zone_type=zone['zone_type'],
                 parking_lots_count=zone['parking_lots_count'],
-                camera_id=zone['camera_id']
+                camera_id=zone['camera_id'],
+                pay=zone['pay']
             )
 
             session.add(new_zone)

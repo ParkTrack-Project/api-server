@@ -58,7 +58,7 @@ class ParkingZone(Base):
     parking_lots_count = Column(Integer)
     camera_id = Column(Integer, ForeignKey('cameras.id'))
     occupied = Column(Integer, default=None)
-    confidence = Column(Integer, default=None)
+    confidence = Column(Float(precision=6), default=None)
     pay = Column(Integer)
     occupancy_updated_at = Column(DateTime, default=None)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

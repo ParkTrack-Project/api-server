@@ -30,7 +30,8 @@ class PublicAPI:
             CORSMiddleware,
             allow_origins=[
                 "https://swagger.parktrack.live",
-                "https://labeler.parktrack.live"
+                "https://labeler.parktrack.live",
+                "https://parktrack.live"
             ],
             allow_methods=["*"],
             allow_headers=["*"],

@@ -32,7 +32,7 @@ class PublicAPI:
                 "https://swagger.parktrack.live",
                 "https://labeler.parktrack.live",
                 "https://parktrack.live",
-                "http://localhost"
+                "http://localhost:5173"
             ],
             allow_methods=["*"],
             allow_headers=["*"],

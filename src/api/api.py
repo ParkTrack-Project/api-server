@@ -31,7 +31,8 @@ class PublicAPI:
             allow_origins=[
                 "https://swagger.parktrack.live",
                 "https://labeler.parktrack.live",
-                "https://parktrack.live"
+                "https://parktrack.live",
+                "http://localhost"
             ],
             allow_methods=["*"],
             allow_headers=["*"],

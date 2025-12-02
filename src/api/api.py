@@ -183,8 +183,10 @@ class PublicAPI:
         async def get_next_camera():
             try:
                 camera = self.db_manager.get_most_outdated_camera()
-                
-                return camera
+
+                return self.db_manager.get_camera(2)
+                # todo: return next id
+                # return camera
 
             except HTTPException:
                 raise

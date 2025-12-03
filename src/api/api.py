@@ -4,6 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .models import CreateCamera, CreateZone
 
+import cv2
+import numpy as np
+from fastapi.responses import StreamingResponse
+from fastapi import HTTPException, status
+import requests
+from io import BytesIO
+from PIL import Image
+
 import json
 
 class URL(BaseModel):
@@ -241,4 +249,52 @@ class PublicAPI:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Internal server error: {str(e)}"
+                )
+
+        @self.app.get("/cameras/{camera_id}/snapshot")
+        async def get_camera_snapshot(camera_id: int):
+            try:
+                camera = self.db_manager.get_camera(camera_id)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
+
+            source_url = camera.source
+
+            try:
+                cap = cv2.VideoCapture(source_url)
+
+                if not cap.isOpened():
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to open video stream"
+                    )
+
+                ret, frame = cap.read()
+
+                cap.release()
+
+                if not ret:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to capture a frame from the video stream"
+                    )
+
+                _, buffer = cv2.imencode('.jpg', frame)
+                img = Image.open(BytesIO(buffer))
+
+                img_byte_arr = BytesIO()
+                img.save(img_byte_arr, format='JPEG')
+                img_byte_arr.seek(0)
+
+                return StreamingResponse(img_byte_arr, media_type="image/jpeg")
+
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error capturing frame: {str(e)}"
                 )

@@ -5,14 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import CreateCamera, CreateZone
 
 import cv2
-import numpy as np
 from fastapi.responses import StreamingResponse
 from fastapi import HTTPException, status
-import requests
 from io import BytesIO
 from PIL import Image
 
-import json
 
 class URL(BaseModel):
     port: str

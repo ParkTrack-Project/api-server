@@ -260,7 +260,8 @@ class PublicAPI:
                     detail=f"Internal server error: {str(e)}"
                 )
 
-            source_url = camera.source
+            print(camera)
+            source_url = camera["source"]
 
             try:
                 cap = cv2.VideoCapture(source_url)

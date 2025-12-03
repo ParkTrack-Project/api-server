@@ -42,7 +42,7 @@ class PublicAPI:
 
     def run(self, listen_on: URL):
         import uvicorn
-        uvicorn.run(self.app, host=listen_on.host, port=listen_on.port)
+        uvicorn.run(self.app, host=listen_on.host, port=int(listen_on.port))
 
     def _setup_routes(self):
 

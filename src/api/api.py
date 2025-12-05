@@ -204,6 +204,12 @@ class PublicAPI:
             try:
                 camera = self.db_manager.get_camera(camera_id)
                 
+                if camera is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Camera with id {camera_id} doesn't exist"
+                    )
+
                 return camera
 
             except HTTPException:
@@ -223,7 +229,7 @@ class PublicAPI:
                 if camera is None:
                     raise HTTPException(
                         status_code=404,
-                        detail=f"Zone with id {camera_id} doesn't exist"
+                        detail=f"Camera with id {camera_id} doesn't exist"
                     )
 
                 return camera

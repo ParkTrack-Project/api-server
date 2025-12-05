@@ -223,6 +223,12 @@ class PublicAPI:
         @self.app.put("/cameras/{camera_id}")
         async def update_camera(camera_id: int, updated_fields: Request):
             try:
+                if not isinstance(updated_fields, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Request body must be a JSON dict"
+                    )
+                
                 updated_fields = await updated_fields.json()
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
@@ -245,6 +251,12 @@ class PublicAPI:
         @self.app.put("/zones/{zone_id}")
         async def update_zone(zone_id: int, updated_fields: Request):
             try:
+                if not isinstance(updated_fields, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Request body must be a JSON dict"
+                    )
+                
                 updated_fields = await updated_fields.json()
                 zone = self.db_manager.update_zone(zone_id, updated_fields)
 

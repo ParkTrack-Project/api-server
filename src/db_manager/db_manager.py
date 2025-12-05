@@ -281,7 +281,6 @@ class DBManager:
             stmt = update(Camera).where(Camera.id == camera_id)
 
             stmt = stmt.values(updated_fields)
-            print(updated_fields)
 
             session.execute(stmt)
 

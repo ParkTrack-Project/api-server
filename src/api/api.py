@@ -187,7 +187,7 @@ class PublicAPI:
         @self.app.get("/cameras/next")
         async def get_next_camera():
             try:
-                camera = await self.db_manager.get_next_camera()
+                camera = self.db_manager.get_next_camera()
 
                 return camera
 

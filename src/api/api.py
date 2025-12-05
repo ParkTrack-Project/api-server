@@ -220,6 +220,12 @@ class PublicAPI:
                 updated_fields = await updated_fields.json()
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
+                if camera is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Zone with id {camera_id} doesn't exist"
+                    )
+
                 return camera
 
             except HTTPException:
@@ -235,6 +241,12 @@ class PublicAPI:
             try:
                 updated_fields = await updated_fields.json()
                 zone = self.db_manager.update_zone(zone_id, updated_fields)
+
+                if zone is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Zone with id {zone_id} doesn't exist"
+                    )
                 
                 return zone
 

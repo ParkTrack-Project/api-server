@@ -218,7 +218,7 @@ class DBManager:
 
             zone = query.filter(ParkingZone.id == zone_id).one_or_none()
 
-            return zone.serialize() if zone is not None else zone
+            return zone.serialize() if zone is not None else None
     
     def get_all_zones(self, camera_id, min_free_count, max_pay):
         with self.get_session() as session:
@@ -274,7 +274,7 @@ class DBManager:
         with self.get_session() as session:
             camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
 
-            return camera.serialize()
+            return camera.serialize() if camera is not None else None
 
     def update_camera(self, camera_id, updated_fields):
         with self.get_session() as session:
@@ -289,7 +289,7 @@ class DBManager:
 
             camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
 
-            return camera.serialize()
+            return camera.serialize() if camera is not None else None
         
     def update_zone(self, zone_id, updated_fields):
         with self.get_session() as session:
@@ -307,4 +307,4 @@ class DBManager:
 
             zone = session.query(ParkingZone).filter(ParkingZone.id == zone_id).one_or_none()
 
-            return zone.serialize()
+            return zone.serialize() if zone is not None else None

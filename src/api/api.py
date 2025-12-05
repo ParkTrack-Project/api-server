@@ -187,11 +187,9 @@ class PublicAPI:
         @self.app.get("/cameras/next")
         async def get_next_camera():
             try:
-                camera = self.db_manager.get_most_outdated_camera()
+                camera = await self.db_manager.get_next_camera()
 
-                return self.db_manager.get_camera(2)
-                # todo: return next id
-                # return camera
+                return camera
 
             except HTTPException:
                 raise

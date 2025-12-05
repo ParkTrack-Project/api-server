@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, inspect, text, func, update
+from sqlalchemy import create_engine, inspect, text, func, update, select
 from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
@@ -34,10 +34,28 @@ class DBManager:
         return self.total_camera_count
     
     def _next_camera(self):
-        if self.camera_index == self._get_total_camera_count():
-            self.camera_index = 1
-        else:
-            self.camera_index += 1
+        with self.get_session() as session:
+            stmt = (
+                select(Camera.id)
+                .where(Camera.is_active.is_(True), Camera.id > self.camera_index)
+                .order_by(Camera.id)
+                .limit(1)
+            )
+
+            next_id = session.execute(stmt).scalar_one_or_none()
+
+            if next_id is not None: 
+                self.camera_index = next_id
+                return
+            
+            stmt = (
+                select(Camera.id)
+                .where(Camera.is_active.is_(True))
+                .order_by(Camera.id)
+                .limit(1)
+            )
+
+            self.camera_index = session.execute(stmt).scalar_one_or_none()
 
     def _initialize_database(self):
         """Инициализация движка и сессии"""
@@ -244,7 +262,7 @@ class DBManager:
 
             return [camera.serialize() for camera in query.all()]
 
-    def get_most_outdated_camera(self, limit: int = 1):
+    def get_next_camera(self):
         with self.get_session() as session:
             camera = session.query(Camera).filter(Camera.id == self.camera_index).one_or_none()
 

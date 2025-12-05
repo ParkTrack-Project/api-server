@@ -138,3 +138,12 @@ class CarPoint(Base):
     
     def __repr__(self):
         return f"<CarPoint(id={self.id}, car_id={self.car_id}, x={self.x_component}, y={self.y_component})>"
+    
+class Client(Base):
+    __tablename__ = 'client'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token = Column(String(50))
+
+    def __repr__(self):
+        return f"<Client(id={self.id}, token={self.token}>"

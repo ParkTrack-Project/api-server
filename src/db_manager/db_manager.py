@@ -294,7 +294,8 @@ class DBManager:
     def update_zone(self, zone_id, updated_fields):
         with self.get_session() as session:
             stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
-            updated_fields['parking_lots_count'] = updated_fields.pop('capacity')
+            if "capacity" in updated_fields.keys():
+                updated_fields['parking_lots_count'] = updated_fields.pop('capacity')
 
             stmt = stmt.values(
                 updated_fields | {"updated_at": datetime.now(timezone.utc)}

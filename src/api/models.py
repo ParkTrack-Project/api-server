@@ -1,5 +1,5 @@
-from typing import List, Dict, TypedDict, Any
-from pydantic import BaseModel, field_validator
+from typing import List, Dict, TypedDict, Any, Optional, Literal
+from pydantic import BaseModel, field_validator, Field, ValidationError
 import json
 
 class CreateCamera(BaseModel):
@@ -15,7 +15,7 @@ class CreateCamera(BaseModel):
     @classmethod
     def validate_title(cls, title):
         if len(title) < 1 or len(title) > 200:
-            raise ValueError(f"Invalid camera title: {title}")
+            raise ValidationError(f"Invalid camera title: {title}")
         return title
 
     @field_validator('source')
@@ -27,28 +27,28 @@ class CreateCamera(BaseModel):
     @classmethod
     def validate_latitude(cls, latitude):
         if latitude > 90 or latitude < -90:
-            raise ValueError(f"Invalid latitude value: {latitude}")
+            raise ValidationError(f"Invalid latitude value: {latitude}")
         return latitude
     
     @field_validator('longitude')
     @classmethod
     def validate_longitude(cls, longitude):
         if longitude > 180 or longitude < -180:
-            raise ValueError(f"Invalid longitude value: {longitude}")
+            raise ValidationError(f"Invalid longitude value: {longitude}")
         return longitude
     
     @field_validator('image_width')
     @classmethod
     def validate_image_width(cls, image_width):
         if image_width <= 0: 
-            raise ValueError(f"Invalid image_width value: {image_width}")
+            raise ValidationError(f"Invalid image_width value: {image_width}")
         return image_width
     
     @field_validator('image_height')
     @classmethod
     def validate_image_height(cls, image_height):
         if image_height <= 0: 
-            raise ValueError(f"Invalid image_height value: {image_height}")
+            raise ValidationError(f"Invalid image_height value: {image_height}")
         return image_height
     
     @field_validator('calib')
@@ -57,99 +57,52 @@ class CreateCamera(BaseModel):
         if calib is not None:
             try:
                 json.dumps(calib)
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"Invalid calibration data: {e}")
+            except:
+                raise ValidationError(f"Invalid calibration data")
         return calib
 
 class Point(BaseModel):
-    latitude: float
-    longitude: float
-    x: int
-    y: int
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
 
     def __eq__(self, other):
         if not isinstance(other, Point):
             return False
         return (self.x == other.x and self.y == other.y)
 
-    @field_validator('latitude')
-    @classmethod
-    def validate_latitude(cls, latitude):
-        if latitude > 90 or latitude < -90:
-            raise ValueError(f"Invalid latitude value: {latitude}")
-        return latitude
-    
-    @field_validator('longitude')
-    @classmethod
-    def validate_longitude(cls, longitude):
-        if longitude > 180 or longitude < -180:
-            raise ValueError(f"Invalid longitude value: {longitude}")
-        return longitude
-    
-    @field_validator('x')
-    @classmethod
-    def validate_x(cls, x):
-        if x < 0: 
-            raise ValueError(f"Invalid x value: {x}")
-        
-        return x
+class ZoneBase(BaseModel):
+    camera_id: Optional[int] = Field(None, ge=1)
+    zone_type: Optional[Literal['parallel', 'standard']] = None
+    capacity: Optional[int] = Field(None, gt=0)
+    pay: Optional[int] = Field(None, ge=0)
+    points: Optional[List[Point]] = None
 
-    @field_validator('y')
-    @classmethod
-    def validate_y(cls, y):
-        if y < 0: 
-            raise ValueError(f"Invalid y value: {y}")
-        
-        return y
-
-class CreateZone(BaseModel):
-    camera_id: int
-    zone_type: str
-    capacity: int
-    pay: int
-    points: List[Point]
-
-    @field_validator('camera_id')
-    @classmethod
-    def validate_camera_id(cls, camera_id):
-        if camera_id <= 0:
-            raise ValueError(f"Invalid camera_id value: {camera_id}")
-        
-        return camera_id
-    
-    @field_validator('zone_type')
-    @classmethod
-    def validate_zone_type(cls, zone_type):
-        if zone_type not in ['parallel', 'standard']:
-            raise ValueError(f"Invalid zone_type value: {zone_type}")
-        
-        return zone_type
-    
-    @field_validator('capacity')
-    @classmethod
-    def validate_capacity(cls, capacity):
-        if capacity <= 0:
-            raise ValueError(f"Invalid capacity value: {capacity}")
-        
-        return capacity
-        
-    @field_validator('pay')
-    @classmethod
-    def validate_pay(cls, pay):
-        if pay < 0:
-            raise ValueError(f"Invalid pay value: {pay}")
-        
-        return pay
-    
     @field_validator('points')
     @classmethod
-    def validate_points(cls, points):
-        if len(points) != 4:
-            raise ValueError(f"Invalid points count: {len(points)}")
+    def validate_points(cls, v: Optional[List[Point]]) -> Optional[List[Point]]:
+        if v is None:
+            return v
+            
+        if len(v) != 4:
+            raise ValidationError(f"Invalid points count: {len(v)}. Must be exactly 4 points")
         
-        for lhs in range(0, len(points)):
-            for rhs in range(lhs + 1, len(points)):
-                if points[lhs] == points[rhs]:
-                    raise ValueError(f"Degenerate rectangle")
-        
-        return points
+        for lhs in range(0, 4):
+            for rhs in range(lhs + 1, 4):
+                if v[lhs] == v[rhs]:
+                    raise ValidationError(f"Degenerate rectangle")
+            
+        return v
+
+# 3. Модели запросов через наследование
+class CreateZone(ZoneBase):
+    camera_id: int
+    zone_type: Literal['parallel', 'standard']
+    capacity: int = Field(gt=0)
+    pay: int = Field(ge=0)
+    points: List[Point]
+
+class UpdateZone(ZoneBase):
+    occupied: Optional[int] = Field(None, ge=0)
+    confidence: Optional[float] = Field(None, ge=0, le=1)

@@ -322,7 +322,7 @@ class DBManager:
 
             return camera.serialize() if camera is not None else None
         
-    def update_zone(self, zone_id, update):
+    def update_zone(self, zone_id, update_zone):
         if self.get_zone(zone_id) is None: return None
 
         with self.get_session() as session:
@@ -332,7 +332,7 @@ class DBManager:
                     delete(ParkingZonePoint).where(ParkingZonePoint.parking_zone_id == zone_id)
                 )
 
-                for point in update.points: 
+                for point in update_zone.points: 
                     session.add(
                         ParkingZonePoint(
                             parking_zone_id=zone_id,
@@ -345,7 +345,7 @@ class DBManager:
 
             stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
 
-            update_dump = update.model_dump(
+            update_dump = update_zone.model_dump(
                 exclude_none=True,
                 exclude={'points'}
             )

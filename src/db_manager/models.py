@@ -10,7 +10,7 @@ class Camera(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(120))
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True, index=True)
     source = Column(String(250))
     image_height = Column(Integer, default=0)
     image_width = Column(Integer, default=0)
@@ -22,10 +22,6 @@ class Camera(Base):
     
     parking_zones = relationship("ParkingZone", back_populates="camera")
     cars = relationship("Car", back_populates="camera")
-
-    __table_args__ = {
-        Index('ix_camera_active_id', 'is_active', 'id'),
-    }
     
     def __repr__(self):
         return f"<Camera(id={self.id}, title='{self.title}', is_active={self.is_active})>"

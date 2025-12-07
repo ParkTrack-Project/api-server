@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Numeric, ForeignKey, Float, JSON
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Numeric, ForeignKey, Float, JSON, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -22,6 +22,10 @@ class Camera(Base):
     
     parking_zones = relationship("ParkingZone", back_populates="camera")
     cars = relationship("Car", back_populates="camera")
+
+    __table_args__ = {
+        Index('ix_camera_active_id', 'is_active', 'id'),
+    }
     
     def __repr__(self):
         return f"<Camera(id={self.id}, title='{self.title}', is_active={self.is_active})>"
@@ -55,7 +59,7 @@ class ParkingZone(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     zone_type = Column(String(50))
-    parking_lots_count = Column(Integer)
+    capacity = Column(Integer)
     camera_id = Column(Integer, ForeignKey('cameras.id'))
     occupied = Column(Integer, default=None)
     confidence = Column(Float(precision=6), default=None)
@@ -65,7 +69,7 @@ class ParkingZone(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     camera = relationship("Camera", back_populates="parking_zones")
-    points = relationship("ParkingZonePoint", back_populates="parking_zone")
+    points = relationship("ParkingZonePoint", back_populates="parking_zone", cascade='all, delete-orphan')
     
     def __repr__(self):
         return f"<ParkingZone(id={self.id}, zone_type='{self.zone_type}', camera_id={self.camera_id})>"
@@ -75,7 +79,7 @@ class ParkingZone(Base):
             "zone_id": self.id,
             "camera_id": self.camera_id,
             "zone_type": self.zone_type,
-            "capacity": self.parking_lots_count,
+            "capacity": self.capacity,
             "occupied": self.occupied,
             "confidence": self.confidence,
             "pay": self.pay,
@@ -113,37 +117,37 @@ class ParkingZonePoint(Base):
             "longitude": float(self.longitude) if self.longitude else None
         }
 
-class Car(Base):
-    __tablename__ = 'cars'
+# class Car(Base):
+#     __tablename__ = 'cars'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    confidence_rate = Column(Numeric(5, 4))
-    camera_id = Column(Integer, ForeignKey('cameras.id'))
+#     id = Column(Integer, primary_key=True, autoincrement=True)
+#     confidence_rate = Column(Numeric(5, 4))
+#     camera_id = Column(Integer, ForeignKey('cameras.id'))
     
-    camera = relationship("Camera", back_populates="cars")
-    points = relationship("CarPoint", back_populates="car")
+#     camera = relationship("Camera", back_populates="cars")
+#     points = relationship("CarPoint", back_populates="car")
     
-    def __repr__(self):
-        return f"<Car(id={self.id}, confidence={self.confidence_rate}, camera_id={self.camera_id})>"
+#     def __repr__(self):
+#         return f"<Car(id={self.id}, confidence={self.confidence_rate}, camera_id={self.camera_id})>"
 
-class CarPoint(Base):
-    __tablename__ = 'car_points'
+# class CarPoint(Base):
+#     __tablename__ = 'car_points'
     
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    car_id = Column(Integer, ForeignKey('cars.id'))
-    x_component = Column(Numeric(6, 5))
-    y_component = Column(Numeric(6, 5))
+#     id = Column(Integer, primary_key=True, autoincrement=True)
+#     car_id = Column(Integer, ForeignKey('cars.id'))
+#     x_component = Column(Numeric(6, 5))
+#     y_component = Column(Numeric(6, 5))
     
-    car = relationship("Car", back_populates="points")
+#     car = relationship("Car", back_populates="points")
     
-    def __repr__(self):
-        return f"<CarPoint(id={self.id}, car_id={self.car_id}, x={self.x_component}, y={self.y_component})>"
+#     def __repr__(self):
+#         return f"<CarPoint(id={self.id}, car_id={self.car_id}, x={self.x_component}, y={self.y_component})>"
     
-class Client(Base):
-    __tablename__ = 'client'
+# class Client(Base):
+#     __tablename__ = 'client'
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    token = Column(String(50))
+#     id = Column(Integer, primary_key=True, autoincrement=True)
+#     token = Column(String(50))
 
-    def __repr__(self):
-        return f"<Client(id={self.id}, token={self.token}>"
+#     def __repr__(self):
+#         return f"<Client(id={self.id}, token={self.token}>"

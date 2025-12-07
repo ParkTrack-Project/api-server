@@ -21,7 +21,6 @@ class Camera(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     parking_zones = relationship("ParkingZone", back_populates="camera")
-    cars = relationship("Car", back_populates="camera")
     
     def __repr__(self):
         return f"<Camera(id={self.id}, title='{self.title}', is_active={self.is_active})>"

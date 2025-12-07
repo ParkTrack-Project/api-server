@@ -327,7 +327,7 @@ class DBManager:
 
         with self.get_session() as session:
 
-            if update.points is not None:
+            if update_zone.points is not None:
                 session.execute(
                     delete(ParkingZonePoint).where(ParkingZonePoint.parking_zone_id == zone_id)
                 )

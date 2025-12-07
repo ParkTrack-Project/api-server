@@ -59,7 +59,7 @@ jobs:
           SSH="ssh -T -o StrictHostKeyChecking=yes ${{ secrets.USERNAME }}@${{ secrets.SERVER_IP }}"
           APP_ROOT="${{ secrets.PROJECT_PATH }}"
 
-          if $SSH "sleep 5 && systemctl is-active --quiet parktrack-api-server" > /dev/null 2>&1; then
+          if $SSH "sleep 15 && systemctl is-active --quiet parktrack-api-server" > /dev/null 2>&1; then
             echo "systemd reports parktrack-api-server=active."
           else
             echo "Service is NOT active. Fetching logs since last start..."

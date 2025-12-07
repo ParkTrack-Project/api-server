@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, status, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import CreateCamera, CreateZone
+from .models import *
 
 import cv2
 from fastapi.responses import StreamingResponse
@@ -204,6 +204,12 @@ class PublicAPI:
             try:
                 camera = self.db_manager.get_camera(camera_id)
                 
+                if camera is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Camera with id {camera_id} doesn't exist"
+                    )
+
                 return camera
 
             except HTTPException:
@@ -218,12 +224,13 @@ class PublicAPI:
         async def update_camera(camera_id: int, updated_fields: Request):
             try:
                 updated_fields = await updated_fields.json()
+                
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 if camera is None:
                     raise HTTPException(
                         status_code=404,
-                        detail=f"Zone with id {camera_id} doesn't exist"
+                        detail=f"Camera with id {camera_id} doesn't exist"
                     )
 
                 return camera
@@ -237,10 +244,9 @@ class PublicAPI:
                 )
             
         @self.app.put("/zones/{zone_id}")
-        async def update_zone(zone_id: int, updated_fields: Request):
+        async def update_zone(zone_id: int, update: UpdateZone):
             try:
-                updated_fields = await updated_fields.json()
-                zone = self.db_manager.update_zone(zone_id, updated_fields)
+                zone = self.db_manager.update_zone(zone_id, update)
 
                 if zone is None:
                     raise HTTPException(

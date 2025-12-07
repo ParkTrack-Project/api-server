@@ -1,9 +1,10 @@
 import os
-from sqlalchemy import create_engine, inspect, text, func, update, select
+from sqlalchemy import create_engine, inspect, text, func, update, select, delete
 from sqlalchemy.orm import sessionmaker, Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 import contextlib
 from typing import Generator, Optional
+from fastapi import HTTPException
 
 from .models import Base, Camera, ParkingZone, ParkingZonePoint, datetime, timezone
 
@@ -119,6 +120,31 @@ class DBManager:
         except Exception as e:
             print(f"Error creating tables: {e}")
             raise
+
+    def _update_points(self, zone_id, points):
+        if not isinstance(points, list[dict]) or len(points) != 4:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid points request format"
+            )
+        
+        with self.get_session() as session:
+            stmt = delete(ParkingZonePoint).where(ParkingZonePoint.parking_zone_id == zone_id)
+            session.execute(stmt)
+            
+            for point in points:
+                stmt = update(ParkingZonePoint).where(ParkingZonePoint.id == camera_id)
+
+                stmt = stmt.values(updated_fields)
+
+                session.execute(stmt)
+
+                session.commit()
+
+                camera = session.query(Camera).filter(Camera.id == camera_id).one_or_none()
+
+            return camera.serialize() if camera is not None else None
+
 
     @contextlib.contextmanager
     def get_session(self) -> Generator[Session, None, None]:
@@ -277,11 +303,16 @@ class DBManager:
             return camera.serialize() if camera is not None else None
 
     def update_camera(self, camera_id, updated_fields):
+        if not isinstance(updated_fields, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must be a JSON dict"
+            )
+        
         with self.get_session() as session:
             stmt = update(Camera).where(Camera.id == camera_id)
 
             stmt = stmt.values(updated_fields)
-            print(updated_fields)
 
             session.execute(stmt)
 
@@ -291,16 +322,38 @@ class DBManager:
 
             return camera.serialize() if camera is not None else None
         
-    def update_zone(self, zone_id, updated_fields):
+    def update_zone(self, zone_id, update):
+        if self.get_zone(zone_id) is None: return None
+
         with self.get_session() as session:
+
+            if update.points is not None:
+                session.execute(
+                    delete(ParkingZonePoint).where(ParkingZonePoint.parking_zone_id == zone_id)
+                )
+
+                for point in update.points: 
+                    session.add(
+                        ParkingZonePoint(
+                            parking_zone_id=zone_id,
+                            latitude=point.latitude,
+                            longitude=point.longitude,
+                            x=point.x,
+                            y=point.y
+                        )
+                    )
+
             stmt = update(ParkingZone).where(ParkingZone.id == zone_id)
-            if "capacity" in updated_fields.keys():
-                updated_fields['parking_lots_count'] = updated_fields.pop('capacity')
+
+            update_dump = update.model_dump(
+                exclude_none=True,
+                exclude={'points'}
+            )
 
             stmt = stmt.values(
-                updated_fields | {"updated_at": datetime.now(timezone.utc)}
-                    if "occupied" not in updated_fields else 
-                updated_fields | {"occupancy_updated_at": datetime.now(timezone.utc)})
+                update_dump | {"updated_at": datetime.now(timezone.utc)}
+                    if "occupied" not in update_dump else 
+                update_dump | {"occupancy_updated_at": datetime.now(timezone.utc)})
             
             session.execute(stmt)
 

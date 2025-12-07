@@ -95,7 +95,6 @@ class ZoneBase(BaseModel):
             
         return v
 
-# 3. Модели запросов через наследование
 class CreateZone(ZoneBase):
     camera_id: int
     zone_type: Literal['parallel', 'standard']

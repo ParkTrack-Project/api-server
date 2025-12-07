@@ -112,38 +112,3 @@ class ParkingZonePoint(Base):
             "latitude": float(self.latitude) if self.latitude else None,
             "longitude": float(self.longitude) if self.longitude else None
         }
-
-# class Car(Base):
-#     __tablename__ = 'cars'
-    
-#     id = Column(Integer, primary_key=True, autoincrement=True)
-#     confidence_rate = Column(Numeric(5, 4))
-#     camera_id = Column(Integer, ForeignKey('cameras.id'))
-    
-#     camera = relationship("Camera", back_populates="cars")
-#     points = relationship("CarPoint", back_populates="car")
-    
-#     def __repr__(self):
-#         return f"<Car(id={self.id}, confidence={self.confidence_rate}, camera_id={self.camera_id})>"
-
-# class CarPoint(Base):
-#     __tablename__ = 'car_points'
-    
-#     id = Column(Integer, primary_key=True, autoincrement=True)
-#     car_id = Column(Integer, ForeignKey('cars.id'))
-#     x_component = Column(Numeric(6, 5))
-#     y_component = Column(Numeric(6, 5))
-    
-#     car = relationship("Car", back_populates="points")
-    
-#     def __repr__(self):
-#         return f"<CarPoint(id={self.id}, car_id={self.car_id}, x={self.x_component}, y={self.y_component})>"
-    
-# class Client(Base):
-#     __tablename__ = 'client'
-
-#     id = Column(Integer, primary_key=True, autoincrement=True)
-#     token = Column(String(50))
-
-#     def __repr__(self):
-#         return f"<Client(id={self.id}, token={self.token}>"

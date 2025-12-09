@@ -10,6 +10,7 @@ class CameraBase(BaseModel):
     calib: Optional[Any] = None
     latitude: Optional[float] = Field(None, ge=-90, le=90)
     longitude: Optional[float] = Field(None, ge=-180, le=180)
+    is_active: Optional[bool] = None
 
     @field_validator('calib')
     @classmethod

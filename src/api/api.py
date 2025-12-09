@@ -261,7 +261,7 @@ class PublicAPI:
                     detail=f"Internal server error: {str(e)}"
                 )
             
-        @self.app.delete("cameras/{camera_id}")
+        @self.app.delete("/cameras/{camera_id}")
         async def delete_camera(camera_id: int):
             try:
                 camera = self.db_manager.get_camera(camera_id)

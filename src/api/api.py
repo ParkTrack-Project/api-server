@@ -260,6 +260,26 @@ class PublicAPI:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Internal server error: {str(e)}"
                 )
+            
+        @self.app.delete("cameras/{camera_id}")
+        async def delete_camera(camera_id: int):
+            try:
+                camera = self.db_manager.get_camera(camera_id)
+
+                if camera is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Camera with id {camera_id} doesn't exist"
+                    )
+                
+                self.db_manager.delete_camera(camera)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
 
         @self.app.get("/cameras/{camera_id}/snapshot")
         async def get_camera_snapshot(camera_id: int):

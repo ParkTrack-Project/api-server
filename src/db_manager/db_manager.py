@@ -212,7 +212,7 @@ class DBManager:
         with self.get_session() as session:
             new_zone = ParkingZone(
                 zone_type=zone['zone_type'],
-                parking_lots_count=zone['parking_lots_count'],
+                capacity=zone['capacity'],
                 camera_id=zone['camera_id'],
                 pay=zone['pay']
             )
@@ -360,3 +360,8 @@ class DBManager:
             zone = session.query(ParkingZone).filter(ParkingZone.id == zone_id).one_or_none()
 
             return zone.serialize() if zone is not None else None
+        
+    def delete_camera(self, camera):
+        with self.get_session() as session:
+            session.delete(camera)
+            session.commit()

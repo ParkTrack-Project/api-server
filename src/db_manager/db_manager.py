@@ -363,7 +363,7 @@ class DBManager:
         
     def delete_camera(self, camera_id):
         with self.get_session() as session:
-            res = session.query(Camera).filter(Camera.id == camera_id).first_or_none()
+            res = session.query(Camera).filter(Camera.id == camera_id).first()
 
             if res is None: return False
 

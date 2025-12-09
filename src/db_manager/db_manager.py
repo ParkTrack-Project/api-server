@@ -303,14 +303,12 @@ class DBManager:
             return camera.serialize() if camera is not None else None
 
     def update_camera(self, camera_id, updated_fields):
-        if not isinstance(updated_fields, dict):
-            raise HTTPException(
-                status_code=400,
-                detail="Request body must be a JSON dict"
-            )
-        
         with self.get_session() as session:
             stmt = update(Camera).where(Camera.id == camera_id)
+
+            updated_field = updated_fields.model_dump(
+                exclude_none=True
+            )
 
             stmt = stmt.values(updated_fields)
 

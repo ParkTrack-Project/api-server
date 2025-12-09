@@ -221,10 +221,8 @@ class PublicAPI:
                 )
             
         @self.app.put("/cameras/{camera_id}")
-        async def update_camera(camera_id: int, updated_fields: Request):
+        async def update_camera(camera_id: int, updated_fields: CameraBase):
             try:
-                updated_fields = await updated_fields.json()
-                
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 if camera is None:

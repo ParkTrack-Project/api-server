@@ -372,3 +372,15 @@ class DBManager:
             session.commit()
 
             return True
+        
+    def delete_zone(self, zone_id):
+        with self.get_session() as session:
+            res = session.query(ParkingZone).filter(ParkingZone.id == zone_id).first()
+
+            if res is None: return False
+
+            session.delete(res)
+
+            session.commit()
+
+            return True

@@ -276,6 +276,22 @@ class PublicAPI:
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Internal server error: {str(e)}"
                 )
+            
+        @self.app.delete("/zones/{zone_id}")
+        async def delete_zone(zone_id: int):
+            try:
+                if self.db_manager.delete_zone(zone_id) == False:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Zone with id {zone_id} doesn't exist"
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Internal server error: {str(e)}"
+                )
 
         @self.app.get("/cameras/{camera_id}/snapshot")
         async def get_camera_snapshot(camera_id: int):

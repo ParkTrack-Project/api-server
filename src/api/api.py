@@ -255,11 +255,6 @@ class PublicAPI:
                     )
                 
                 return zone
-            except ValidationError:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=f"One or multiple validation errors in\n{update}"
-                )
             except HTTPException:
                 raise
             except Exception as e:

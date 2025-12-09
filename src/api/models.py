@@ -1,5 +1,5 @@
 from typing import List, Dict, TypedDict, Any, Optional, Literal
-from pydantic import BaseModel, field_validator, Field, ValidationError
+from pydantic import BaseModel, field_validator, Field
 import json
 
 class CreateCamera(BaseModel):
@@ -15,7 +15,7 @@ class CreateCamera(BaseModel):
     @classmethod
     def validate_title(cls, title):
         if len(title) < 1 or len(title) > 200:
-            raise ValidationError(f"Invalid camera title: {title}")
+            raise ValueError(f"Invalid camera title: {title}")
         return title
 
     @field_validator('source')
@@ -27,28 +27,28 @@ class CreateCamera(BaseModel):
     @classmethod
     def validate_latitude(cls, latitude):
         if latitude > 90 or latitude < -90:
-            raise ValidationError(f"Invalid latitude value: {latitude}")
+            raise ValueError(f"Invalid latitude value: {latitude}")
         return latitude
     
     @field_validator('longitude')
     @classmethod
     def validate_longitude(cls, longitude):
         if longitude > 180 or longitude < -180:
-            raise ValidationError(f"Invalid longitude value: {longitude}")
+            raise ValueError(f"Invalid longitude value: {longitude}")
         return longitude
     
     @field_validator('image_width')
     @classmethod
     def validate_image_width(cls, image_width):
         if image_width <= 0: 
-            raise ValidationError(f"Invalid image_width value: {image_width}")
+            raise ValueError(f"Invalid image_width value: {image_width}")
         return image_width
     
     @field_validator('image_height')
     @classmethod
     def validate_image_height(cls, image_height):
         if image_height <= 0: 
-            raise ValidationError(f"Invalid image_height value: {image_height}")
+            raise ValueError(f"Invalid image_height value: {image_height}")
         return image_height
     
     @field_validator('calib')
@@ -58,7 +58,7 @@ class CreateCamera(BaseModel):
             try:
                 json.dumps(calib)
             except:
-                raise ValidationError(f"Invalid calibration data")
+                raise ValueError(f"Invalid calibration data")
         return calib
 
 class Point(BaseModel):
@@ -86,12 +86,12 @@ class ZoneBase(BaseModel):
             return v
             
         if len(v) != 4:
-            raise ValidationError(f"Invalid points count: {len(v)}. Must be exactly 4 points")
+            raise ValueError(f"Invalid points count: {len(v)}. Must be exactly 4 points")
         
         for lhs in range(0, 4):
             for rhs in range(lhs + 1, 4):
                 if v[lhs] == v[rhs]:
-                    raise ValidationError(f"Degenerate rectangle")
+                    raise ValueError(f"Degenerate rectangle")
             
         return v
 

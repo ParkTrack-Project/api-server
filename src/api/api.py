@@ -264,15 +264,11 @@ class PublicAPI:
         @self.app.delete("/cameras/{camera_id}")
         async def delete_camera(camera_id: int):
             try:
-                camera = self.db_manager.get_camera(camera_id)
-
-                if camera is None:
+                if self.db_manager.delete_camera(camera_id) == 0:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail=f"Camera with id {camera_id} doesn't exist"
                     )
-                
-                self.db_manager.delete_camera(camera)
             except HTTPException:
                 raise
             except Exception as e:

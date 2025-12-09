@@ -361,7 +361,10 @@ class DBManager:
 
             return zone.serialize() if zone is not None else None
         
-    def delete_camera(self, camera):
+    def delete_camera(self, camera_id):
         with self.get_session() as session:
-            session.delete(camera)
+            res = session.query(Camera).filter(Camera.id == camera_id).delete()
+
             session.commit()
+
+            return res

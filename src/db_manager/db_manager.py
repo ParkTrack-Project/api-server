@@ -306,7 +306,7 @@ class DBManager:
         with self.get_session() as session:
             stmt = update(Camera).where(Camera.id == camera_id)
 
-            updated_field = updated_fields.model_dump(
+            updated_fields = updated_fields.model_dump(
                 exclude_none=True
             )
 

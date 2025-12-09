@@ -223,8 +223,6 @@ class PublicAPI:
         @self.app.put("/cameras/{camera_id}")
         async def update_camera(camera_id: int, updated_fields: CameraBase):
             try:
-                raise Exception("Hiii")
-                
                 camera = self.db_manager.update_camera(camera_id, updated_fields)
                 
                 if camera is None:

@@ -103,7 +103,7 @@ class PublicAPI:
                 
                 zone_id = self.db_manager.create_zone({
                     "zone_type": new_zone.zone_type,
-                    "parking_lots_count": new_zone.capacity,
+                    "capacity": new_zone.capacity,
                     "camera_id": new_zone.camera_id,
                     "pay": new_zone.pay,
                     "points": new_zone.points

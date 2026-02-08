@@ -294,6 +294,12 @@ class DBManager:
 
             self._next_camera()
 
+            if camera is None:
+                camera = session.query(Camera).filter(Camera.is_active.is_(True)).first()
+                if camera:
+                    self.camera_index = camera.id
+                    self._next_camera()
+
             return camera.serialize() if camera is not None else {}
         
     def get_camera(self, camera_id):

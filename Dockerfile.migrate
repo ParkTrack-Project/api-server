@@ -4,7 +4,7 @@ FROM migrate/migrate:latest AS migrate-bin
 
 FROM alpine:latest
 
-RUN apk --no-cache bash postgresql-client
+RUN apk add --no-cache bash postgresql-client
 COPY --from=migrate-bin /usr/local/bin/migrate /usr/local/bin/migrate
 COPY --from=seqwall-builder /go/bin/seqwall /usr/local/bin/seqwall
 
@@ -13,4 +13,4 @@ COPY migrations ./migrations
 COPY scripts ./scripts
 RUN chmod +x ./scripts/*.sh
 
-ENTRYPOINT [ "bash", "./scripts/entrypoint.sh" ]
+ENTRYPOINT [ "bash", "./scripts/db_entrypoint.sh" ]

@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..db_models import Camera, ParkingZone, Partner, User
+from ..dependencies import CurrentUser, require
+from ..schemas.zones import (
+    CreateZoneRequest,
+    UpdateZoneRequest,
+    ZoneListResponse,
+    ZoneMapItemResponse,
+    ZoneResponse,
+)
+
+router = APIRouter(prefix="/zones", tags=["Parking Zones"])
+
+
+def _serialize(z: ParkingZone, db: Session) -> ZoneResponse:
+    # free_count — GENERATED ALWAYS AS в БД, читаем свежим SELECT
+    free_count = db.execute(
+        text("SELECT free_count FROM parking_zones WHERE parking_zone_id = :id"),
+        {"id": z.parking_zone_id},
+    ).scalar_one_or_none() or 0
+
+    return ZoneResponse(
+        zone_id=z.parking_zone_id,
+        camera_id=z.camera_id,
+        zone_type=z.zone_type.value,
+        capacity=z.capacity,
+        occupied=z.occupied,
+        free_count=free_count,
+        confidence=z.confidence or 0.0,
+        confidence_level=z.confidence_level.value if z.confidence_level else None,
+        pay=z.pay,
+        geometry=z.geometry,
+        image_polygon=z.image_polygon,
+        partner_id=z.partner_id,
+        created_by_user_id=z.created_by_user_id,
+        is_active=z.is_active,
+        location_type=z.location_type.value if z.location_type else None,
+        is_private=z.is_private,
+        is_accessible=z.is_accessible,
+        occupancy_updated_at=z.occupancy_updated_at,
+        created_at=z.created_at,
+        updated_at=z.updated_at,
+    )
+
+
+def _serialize_map(z: ParkingZone, db: Session) -> ZoneMapItemResponse:
+    free_count = db.execute(
+        text("SELECT free_count FROM parking_zones WHERE parking_zone_id = :id"),
+        {"id": z.parking_zone_id},
+    ).scalar_one_or_none() or 0
+
+    return ZoneMapItemResponse(
+        zone_id=z.parking_zone_id,
+        zone_type=z.zone_type.value,
+        capacity=z.capacity,
+        occupied=z.occupied,
+        free_count=free_count,
+        confidence=z.confidence or 0.0,
+        confidence_level=z.confidence_level.value if z.confidence_level else None,
+        pay=z.pay,
+        geometry=z.geometry,
+        location_type=z.location_type.value if z.location_type else None,
+        is_private=z.is_private,
+        is_accessible=z.is_accessible,
+        occupancy_updated_at=z.occupancy_updated_at,
+        is_active=z.is_active,
+    )
+
+
+def _get_zone_or_404(db: Session, zone_id: int) -> ParkingZone:
+    zone = db.query(ParkingZone).filter(ParkingZone.parking_zone_id == zone_id).one_or_none()
+    if zone is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail={"error_description": "Zone not found"})
+    return zone
+
+
+# ---------------------------------------------------------------------------
+# GET /zones
+# ---------------------------------------------------------------------------
+
+@router.get("", response_model=list[ZoneResponse] | list[ZoneMapItemResponse])
+def list_zones(
+    current_user: Annotated[User, require("zones.view")],
+    db: Annotated[Session, Depends(get_db)],
+    camera_id:      int   | None = None,
+    partner_id:     int   | None = None,
+    is_active:      bool  | None = None,
+    min_free_count: int   | None = None,
+    max_pay:        int   | None = None,
+    bbox:           str   | None = None,
+    view:           str          = "full",
+    top:            int          = 100,
+    offset:         int          = 0,
+):
+    query = db.query(ParkingZone)
+
+    if camera_id is not None:
+        query = query.filter(ParkingZone.camera_id == camera_id)
+    if partner_id is not None:
+        query = query.filter(ParkingZone.partner_id == partner_id)
+    if is_active is not None:
+        query = query.filter(ParkingZone.is_active == is_active)
+    if max_pay is not None:
+        query = query.filter(ParkingZone.pay <= max_pay)
+    if min_free_count is not None:
+        # free_count — вычисляемое поле, фильтруем через выражение
+        query = query.filter(
+            (ParkingZone.capacity - ParkingZone.occupied) >= min_free_count
+        )
+
+    zones = query.order_by(ParkingZone.parking_zone_id).offset(offset).limit(top).all()
+
+    if view == "map":
+        return [_serialize_map(z, db) for z in zones]
+    return [_serialize(z, db) for z in zones]
+
+
+# ---------------------------------------------------------------------------
+# POST /zones/new
+# ---------------------------------------------------------------------------
+
+@router.post("/new", status_code=status.HTTP_201_CREATED)
+def create_zone(
+    body: CreateZoneRequest,
+    current_user: Annotated[User, require("zones.create")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    if not db.query(Camera).filter(Camera.camera_id == body.camera_id).one_or_none():
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail={"error_description": f"Camera {body.camera_id} not found"})
+
+    if body.partner_id is not None:
+        if not db.query(Partner).filter(Partner.partner_id == body.partner_id).one_or_none():
+            raise HTTPException(status.HTTP_404_NOT_FOUND,
+                                detail={"error_description": "Partner not found"})
+
+    zone = ParkingZone(
+        camera_id=body.camera_id,
+        zone_type=body.zone_type,
+        capacity=body.capacity,
+        occupied=0,
+        pay=body.pay,
+        geometry=body.geometry,
+        image_polygon=body.image_polygon,
+        partner_id=body.partner_id,
+        created_by_user_id=current_user.user_id,
+        is_active=True,
+        location_type=body.location_type,
+        is_private=body.is_private,
+        is_accessible=body.is_accessible,
+    )
+    db.add(zone)
+    db.commit()
+    db.refresh(zone)
+    return {"zone_id": zone.parking_zone_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /zones/{zone_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/{zone_id}", response_model=ZoneResponse)
+def get_zone(
+    zone_id: int,
+    current_user: Annotated[User, require("zones.view")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    return _serialize(_get_zone_or_404(db, zone_id), db)
+
+
+# ---------------------------------------------------------------------------
+# PUT /zones/{zone_id}
+# ---------------------------------------------------------------------------
+
+@router.put("/{zone_id}", response_model=ZoneResponse)
+def update_zone(
+    zone_id: int,
+    body: UpdateZoneRequest,
+    current_user: Annotated[User, require("zones.update")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    zone = _get_zone_or_404(db, zone_id)
+
+    update_data = body.model_dump(exclude_none=True)
+
+    occupied_changed = "occupied" in update_data
+
+    for field, value in update_data.items():
+        setattr(zone, field, value)
+
+    now = datetime.now(timezone.utc)
+    if occupied_changed:
+        zone.occupancy_updated_at = now
+    else:
+        zone.updated_at = now
+
+    db.commit()
+    db.refresh(zone)
+    return _serialize(zone, db)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /zones/{zone_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/{zone_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_zone(
+    zone_id: int,
+    current_user: Annotated[User, require("zones.delete")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    zone = _get_zone_or_404(db, zone_id)
+    db.delete(zone)
+    db.commit()
+    return None

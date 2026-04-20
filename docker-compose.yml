@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:18.3
     container_name: postgres_db
-    restart: unless_stopped
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -45,4 +45,4 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    restart: unless_stopped
+    restart: unless-stopped

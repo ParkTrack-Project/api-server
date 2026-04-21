@@ -1,6 +1,6 @@
 CREATE TYPE zone_types AS ENUM ('parallel', 'standard');
-CREATE TYPE confidence_level_types AS ENUM ('very_low', 'low', 'medium', 'high')
-CREATE TYPE location_types AS ENUM ('street', 'yard', 'open_lot', 'underground', 'multilevel')
+CREATE TYPE confidence_level_types AS ENUM ('very_low', 'low', 'medium', 'high');
+CREATE TYPE location_types AS ENUM ('street', 'yard', 'open_lot', 'underground', 'multilevel');
 
 CREATE TABLE IF NOT EXISTS parking_zones (
     parking_zone_id SERIAL PRIMARY KEY,
@@ -22,5 +22,5 @@ CREATE TABLE IF NOT EXISTS parking_zones (
     is_accessible BOOLEAN,
     occupancy_updated_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );

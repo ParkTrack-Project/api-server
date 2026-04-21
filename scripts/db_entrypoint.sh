@@ -23,7 +23,7 @@ seqwall staircase \
 
 echo "test2"
 
-if [ -n "$MIGRATION_VERSION" ]; then
+if [ -n "${MIGRATION_VERSION:-}" ]; then
 	migrate -path ./migrations -database "$MAIN_DB_URL" goto "$MIGRATION_VERSION"
 else
 	migrate -path ./migrations -database "$MAIN_DB_URL" up

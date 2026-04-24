@@ -1,7 +1,4 @@
-
-
 CREATE TYPE global_roles AS ENUM ('user', 'admin');
-
 
 CREATE TABLE IF NOT EXISTS users (
     user_id SERIAL PRIMARY KEY,

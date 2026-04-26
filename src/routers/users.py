@@ -14,6 +14,9 @@ from ..schemas.users import (
     UpdateUserRequest,
     UserListResponse,
     UserResponse,
+    UserProfile,
+    PartnerMembershipInfo,
+    AdminCreateUserRequest
 )
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -29,6 +32,7 @@ def _serialize(user: User) -> UserResponse:
         is_active=user.is_active,
         created_at=user.created_at,
         updated_at=user.updated_at,
+        is_email_verified=True
     )
 
 
@@ -66,10 +70,40 @@ def list_users(
 # GET /users/me
 # ---------------------------------------------------------------------------
 
-@router.get("/me", response_model=UserResponse)
-def get_me(current_user: Annotated[User, require("users.me.view")]):
-    return _serialize(current_user)
+# routers/users.py
 
+from ..db_models import Partner, PartnerMembership  # if not already imported
+from ..schemas.users import UserProfile, PartnerMembershipInfo
+
+@router.get("/me", response_model=UserProfile)
+def get_me(
+    current_user: Annotated[User, require("users.me.view")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    # Fetch partner memberships with partner’s is_active
+    memberships = (
+        db.query(PartnerMembership, Partner.is_active)
+        .join(Partner, PartnerMembership.partner_id == Partner.partner_id)
+        .filter(PartnerMembership.user_id == current_user.user_id)
+        .all()
+    )
+
+    membership_data = [
+        PartnerMembershipInfo(
+            partner_id=m.partner_id,
+            role=m.user_role,
+            is_active=partner_is_active,
+            read_scope=m.read_scope,
+            write_scope=m.write_scope,
+            delete_scope=m.delete_scope,
+        )
+        for m, partner_is_active in memberships
+    ]
+
+    return UserProfile(
+        user=_serialize(current_user),
+        partner_memberships=membership_data,
+    )
 
 # ---------------------------------------------------------------------------
 # PUT /users/me
@@ -107,7 +141,7 @@ def change_password(
     current_user: Annotated[User, require("users.password.update")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    if not verify_password(body.old_password, current_user.hashed_password):
+    if not verify_password(body.current_password, current_user.hashed_password):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                             detail={"error_description": "Old password is incorrect"})
     current_user.hashed_password = hash_password(body.new_password)
@@ -189,3 +223,30 @@ def delete_user(
     db.delete(user)
     db.commit()
     return None
+
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=UserResponse)
+def admin_create_user(
+    body: AdminCreateUserRequest,
+    current_user: Annotated[User, require("admin.users.manage")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    if db.query(User).filter(User.email == body.email).one_or_none():
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            detail={"error_description": "User with this email already exists"})
+    try:
+        role = GlobalRole(body.global_role)
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={"error_description": f"Unknown role: {body.global_role}"})
+    user = User(
+        email=body.email,
+        hashed_password=hash_password(body.password),
+        full_name=body.full_name,
+        phone=body.phone,
+        global_role=role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _serialize(user)

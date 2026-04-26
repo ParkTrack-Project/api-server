@@ -32,7 +32,19 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 # Вспомогательная функция сборки ответа
 # ---------------------------------------------------------------------------
 
-def _build_token_response(user: User) -> TokenResponse:
+def _build_token_response(user: User, db: Session) -> TokenResponse:
+    effective = get_effective_permissions(user)
+    memberships = [
+        PartnerMembershipInfo(
+            partner_id=m.partner_id,
+            role=m.user_role,
+            permissions=[],
+            read_scope=m.read_scope,
+            write_scope=m.write_scope,
+            delete_scope=m.delete_scope,
+        )
+        for m in user.memberships
+    ]
     token = create_access_token(user.user_id)
     return TokenResponse(
         access_token=token,
@@ -42,10 +54,11 @@ def _build_token_response(user: User) -> TokenResponse:
             user_id=user.user_id,
             email=user.email,
             full_name=user.full_name,
-            global_roles=[user.global_role.value],
+            global_role=user.global_role.value,
+            permissions=sorted(effective),
+            partner_memberships=memberships,
         ),
     )
-
 
 # ---------------------------------------------------------------------------
 # POST /auth/register
@@ -72,7 +85,7 @@ def register(body: RegisterRequest, db: Annotated[Session, Depends(get_db)]):
     db.commit()
     db.refresh(user)
 
-    return _build_token_response(user)
+    return _build_token_response(user, db)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +108,7 @@ def login(body: LoginRequest, db: Annotated[Session, Depends(get_db)]):
             detail={"error_description": "Account is disabled"},
         )
 
-    return _build_token_response(user)
+    return _build_token_response(user, db)
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +148,7 @@ def me(current_user: Annotated[User, require("users.me.view")]):
         user_id=current_user.user_id,
         email=current_user.email,
         full_name=current_user.full_name,
-        global_roles=[current_user.global_role.value],
+        global_role=current_user.global_role.value,
         permissions=sorted(effective_permissions),
         partner_memberships=memberships,
     )

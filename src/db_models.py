@@ -236,3 +236,29 @@ class ParkingZone(Base):
 
     def __repr__(self) -> str:
         return f"<ParkingZone id={self.parking_zone_id} camera_id={self.camera_id}>"
+
+
+# ---------------------------------------------------------------------------
+# Datasources
+# ---------------------------------------------------------------------------
+
+class DataSource(Base):
+    __tablename__ = "data_sources"
+
+    source_id          = Column(Integer, primary_key=True, autoincrement=True)
+    partner_id         = Column(Integer, ForeignKey("partners.partner_id", ondelete="SET NULL"), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.user_id",       ondelete="SET NULL"), nullable=True)
+    source_type        = Column(String(50),  nullable=False)
+    entity_type        = Column(String(50),  nullable=False)
+    entity_id          = Column(Integer,     nullable=False)
+    title              = Column(String(255), nullable=False)
+    status             = Column(String(20),  nullable=False, default="unknown")
+    last_data_at       = Column(DateTime(timezone=True), nullable=True)
+    last_error         = Column(Text, nullable=True)
+    is_active          = Column(Boolean, default=True)
+    created_at         = Column(DateTime(timezone=True), default=_now)
+    updated_at         = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("entity_type", "entity_id", name="uq_source_entity"),
+    )

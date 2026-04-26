@@ -25,7 +25,7 @@ router = APIRouter(prefix="/partners", tags=["Partners"])
 def _serialize_partner(p: Partner) -> PartnerResponse:
     return PartnerResponse(
         partner_id=p.partner_id,
-        legal_name=p.legal_name,
+        name=p.legal_name,
         slug=p.slug,
         contact_email=p.contact_email,
         contact_phone=p.contact_phone,
@@ -206,10 +206,10 @@ def list_members(
 
 
 # ---------------------------------------------------------------------------
-# POST /partners/{partner_id}/members/invite
+# POST /partners/{partner_id}/members
 # ---------------------------------------------------------------------------
 
-@router.post("/{partner_id}/members/invite", status_code=status.HTTP_201_CREATED)
+@router.post("/{partner_id}/members", status_code=status.HTTP_201_CREATED)
 def invite_member(
     partner_id: int,
     body: InviteMemberRequest,

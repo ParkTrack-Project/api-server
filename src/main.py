@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import auth, users, partners, cameras, zones, admin
+from .routers import auth, users, partners, cameras, zones, admin, sources
 from .database import engine
 from .db_models import Base
 
@@ -26,6 +26,7 @@ app.add_middleware(
         "https://labeler.parktrack.live",
         "https://parktrack.live",
         "http://localhost:5173",
+        "http://127.0.0.1:5173"
     ],
     allow_methods=["*"],
     allow_headers=["*"],

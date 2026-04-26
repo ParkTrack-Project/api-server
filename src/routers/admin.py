@@ -13,7 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, ParkingZone, Partner, User
+from ..db_models import Camera, ParkingZone, Partner, User, DataSource
 from ..dependencies import require
 from ..routers.partners import _serialize_partner, list_partners
 from ..routers.users import _serialize as _serialize_user, list_users
@@ -122,8 +122,8 @@ def admin_overview(
         cameras_active=count(Camera, Camera.is_active.is_(True)),
         zones_total=count(ParkingZone),
         zones_active=count(ParkingZone, ParkingZone.is_active.is_(True)),
-        sources_total=0,    # data_sources не реализованы в этом спринте
-        sources_active=0,
+        sources_total=count(DataSource),
+        sources_active=count(DataSource, DataSource.is_active.is_(True)),
         routes_active=0,    # routing не реализован в этом спринте
         updated_at=datetime.now(timezone.utc).isoformat(),
     )

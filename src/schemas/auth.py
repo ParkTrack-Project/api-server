@@ -27,7 +27,9 @@ class AuthUserInfo(BaseModel):
     user_id:      int
     email:        str
     full_name:    str | None
-    global_roles: list[str]
+    global_role:  str
+    permissions:  list[str]
+    partner_memberships: list[PartnerMembershipInfo]
 
 
 class TokenResponse(BaseModel):
@@ -48,12 +50,13 @@ class PartnerMembershipInfo(BaseModel):
     read_scope:   str
     write_scope:  str
     delete_scope: str
+    is_active:    bool
 
 
 class MeResponse(BaseModel):
     user_id:             int
     email:               str
     full_name:           str | None
-    global_roles:        list[str]
+    global_role:        str
     permissions:         list[str]
     partner_memberships: list[PartnerMembershipInfo]

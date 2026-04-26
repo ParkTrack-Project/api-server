@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 class PartnerResponse(BaseModel):
     partner_id:    int
-    legal_name:    str
+    name:          str
     slug:          str
     contact_email: str
     contact_phone: str

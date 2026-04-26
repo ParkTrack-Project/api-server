@@ -12,6 +12,7 @@ class UserResponse(BaseModel):
     phone:      str | None
     global_role: str
     is_active:  bool
+    is_email_verified: bool
     created_at: datetime
     updated_at: datetime
 
@@ -41,3 +42,24 @@ class UserListResponse(BaseModel):
     total:  int
     top:    int
     offset: int
+
+class PartnerMembershipInfo(BaseModel):
+    partner_id:   int
+    role:         str          
+    is_active:    bool          
+    read_scope:   str
+    write_scope:  str
+    delete_scope: str
+
+
+class UserProfile(BaseModel):
+    user:                UserResponse
+    partner_memberships: list[PartnerMembershipInfo]
+
+class AdminCreateUserRequest(BaseModel):
+    email:      EmailStr
+    password:   str = Field(min_length=6)
+    full_name:  str | None = Field(None, max_length=255)
+    phone:      str | None = Field(None, max_length=50)
+    global_role: str = "user"
+    

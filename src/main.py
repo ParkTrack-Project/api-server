@@ -45,6 +45,7 @@ app.include_router(partners.router, prefix=PREFIX)
 app.include_router(cameras.router,  prefix=PREFIX)
 app.include_router(zones.router,    prefix=PREFIX)
 app.include_router(admin.router,    prefix=PREFIX)
+app.include_router(sources.router,  prefix=PREFIX)
 
 
 # ---------------------------------------------------------------------------

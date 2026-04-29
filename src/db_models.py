@@ -77,7 +77,12 @@ class User(Base):
     created_at      = Column(DateTime(timezone=True), default=_now)
     updated_at      = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
-    permissions     = relationship("UserPermission",    back_populates="user", cascade="all, delete-orphan")
+    permissions     = relationship(
+        "UserPermission",
+        foreign_keys="UserPermission.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
     sessions        = relationship("Session",           back_populates="user", cascade="all, delete-orphan")
     memberships     = relationship("PartnerMembership", back_populates="user", cascade="all, delete-orphan")
 

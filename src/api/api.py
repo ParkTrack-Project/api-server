@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import *
 
 import cv2
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import HTTPException, status
 from io import BytesIO
 from PIL import Image
@@ -54,7 +54,11 @@ class PublicAPI:
         @self.app.get("/health")
         async def get_health():
             db_ok = self.db_manager.check_connection()
-            return {"status": "healthy" if db_ok else "degraded"}
+
+            return JSONResponse(
+                content={"status": "healthy" if db_ok else "degraded"},
+                status_code=200 if db_ok else 500
+            )
         
         @self.app.get("/version")
         async def get_version():

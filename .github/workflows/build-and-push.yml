@@ -41,21 +41,45 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Extract metadata
+      - name: Extract metadata [app]
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-app
           tags: |
             type=raw,value=development,enable=${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,format=short
 
-      - name: Build and push
+      - name: Build and push [app]
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ./Dockerfile.app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Extract metadata [migrate]
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-migrate
+          tags: |
+            type=raw,value=development,enable=${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,format=short
+
+      - name: Build and push [migrate]
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.migrate
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

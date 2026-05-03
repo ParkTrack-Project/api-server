@@ -84,7 +84,9 @@ BASE_USER_PERMISSIONS: frozenset[str] = frozenset({
     "forecasts.view",
     "routing.create",
     "feedback.create",
-    "sources.view"
+    "sources.view",
+    "occupancy.view",
+    "forecasts.view"
 })
 
 BASE_ADMIN_PERMISSIONS: frozenset[str] = frozenset({

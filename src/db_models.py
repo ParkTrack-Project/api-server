@@ -267,3 +267,82 @@ class DataSource(Base):
     __table_args__ = (
         UniqueConstraint("entity_type", "entity_id", name="uq_source_entity"),
     )
+
+"""
+Дополнение к db_models.py — модели OccupancyObservation и Forecast.
+Добавь этот блок в конец существующего src/db_models.py.
+"""
+
+# ---------------------------------------------------------------------------
+# Occupancy Observations
+# ---------------------------------------------------------------------------
+
+class OccupancyObservation(Base):
+    __tablename__ = "occupancy_observations"
+
+    observation_id     = Column(Integer, primary_key=True, autoincrement=True)
+    zone_id            = Column(Integer, ForeignKey("parking_zones.parking_zone_id", ondelete="CASCADE"), nullable=False)
+    camera_id          = Column(Integer, ForeignKey("cameras.camera_id",   ondelete="SET NULL"), nullable=True)
+    partner_id         = Column(Integer, ForeignKey("partners.partner_id", ondelete="SET NULL"), nullable=True)
+    source_type        = Column(String(50),  nullable=False)
+    source_ref         = Column(String(255), nullable=True)
+    capacity           = Column(Integer, nullable=False)
+    occupied           = Column(Integer, nullable=False)
+    # free_count — GENERATED ALWAYS AS (capacity - occupied) STORED
+    confidence         = Column(Double, nullable=False)
+    confidence_level   = Column(Enum(ConfidenceLevel, name="confidence_level_types",
+                                     create_type=False), nullable=True)
+    observed_at        = Column(DateTime(timezone=True), nullable=False)
+    ingested_at        = Column(DateTime(timezone=True), default=_now)
+    metadata           = Column(JSONB, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
+
+    zone       = relationship("ParkingZone", foreign_keys=[zone_id])
+    camera     = relationship("Camera",      foreign_keys=[camera_id])
+    partner    = relationship("Partner",     foreign_keys=[partner_id])
+    created_by = relationship("User",        foreign_keys=[created_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_ref", name="uq_occupancy_source"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<OccupancyObservation id={self.observation_id} zone_id={self.zone_id}>"
+
+
+# ---------------------------------------------------------------------------
+# Forecasts
+# ---------------------------------------------------------------------------
+
+class Forecast(Base):
+    __tablename__ = "forecasts"
+
+    forecast_id            = Column(Integer, primary_key=True, autoincrement=True)
+    zone_id                = Column(Integer, ForeignKey("parking_zones.parking_zone_id", ondelete="CASCADE"), nullable=False)
+    camera_id              = Column(Integer, ForeignKey("cameras.camera_id",   ondelete="SET NULL"), nullable=True)
+    partner_id             = Column(Integer, ForeignKey("partners.partner_id", ondelete="SET NULL"), nullable=True)
+    model_type             = Column(String(50),  nullable=False)
+    model_version          = Column(String(100), nullable=True)
+    generated_at           = Column(DateTime(timezone=True), nullable=False)
+    predicted_for          = Column(DateTime(timezone=True), nullable=False)
+    capacity               = Column(Integer, nullable=False)
+    predicted_occupied     = Column(Integer, nullable=False)
+    # predicted_free_count — GENERATED ALWAYS AS (capacity - predicted_occupied) STORED
+    probability_free_space = Column(Double, nullable=False)
+    confidence             = Column(Double, nullable=False)
+    confidence_level       = Column(Enum(ConfidenceLevel, name="confidence_level_types",
+                                         create_type=False), nullable=True)
+    metadata               = Column(JSONB, nullable=True)
+    created_by_user_id     = Column(Integer, ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
+
+    zone       = relationship("ParkingZone", foreign_keys=[zone_id])
+    camera     = relationship("Camera",      foreign_keys=[camera_id])
+    partner    = relationship("Partner",     foreign_keys=[partner_id])
+    created_by = relationship("User",        foreign_keys=[created_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("zone_id", "generated_at", "predicted_for", name="uq_forecast_point"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Forecast id={self.forecast_id} zone_id={self.zone_id} for={self.predicted_for}>"

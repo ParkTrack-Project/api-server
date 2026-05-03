@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Annotated, Union
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..db_models import ConfidenceLevel, OccupancyObservation, ParkingZone, User
+from ..dependencies import require
+from ..schemas.occupancy import (
+    CreateOccupancyRequest,
+    OccupancyMapItem,
+    OccupancyObservationResponse,
+    OccupancySeriesPoint,
+    UpdateOccupancyRequest,
+)
+
+router = APIRouter(prefix="/occupancy", tags=["Occupancy"])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _free_count(obs: OccupancyObservation, db: Session) -> int:
+    row = db.execute(
+        text("SELECT free_count FROM occupancy_observations WHERE observation_id = :id"),
+        {"id": obs.observation_id},
+    ).one_or_none()
+    return row[0] if row else (obs.capacity - obs.occupied)
+
+
+def _confidence_level(confidence: float) -> ConfidenceLevel | None:
+    if confidence >= 0.85:
+        return ConfidenceLevel.high
+    elif confidence >= 0.65:
+        return ConfidenceLevel.medium
+    elif confidence >= 0.40:
+        return ConfidenceLevel.low
+    else:
+        return ConfidenceLevel.very_low
+
+
+def _serialize_obs(obs: OccupancyObservation, db: Session) -> OccupancyObservationResponse:
+    return OccupancyObservationResponse(
+        observation_id=obs.observation_id,
+        zone_id=obs.zone_id,
+        camera_id=obs.camera_id,
+        partner_id=obs.partner_id,
+        source_type=obs.source_type,
+        source_ref=obs.source_ref,
+        capacity=obs.capacity,
+        occupied=obs.occupied,
+        free_count=_free_count(obs, db),
+        confidence=obs.confidence,
+        confidence_level=obs.confidence_level.value if obs.confidence_level else None,
+        observed_at=obs.observed_at,
+        ingested_at=obs.ingested_at,
+        metadata=obs.metadata,
+        created_by_user_id=obs.created_by_user_id,
+    )
+
+
+def _get_obs_or_404(db: Session, observation_id: int) -> OccupancyObservation:
+    obs = db.query(OccupancyObservation).filter(
+        OccupancyObservation.observation_id == observation_id
+    ).one_or_none()
+    if obs is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail={"error_description": "Observation not found"})
+    return obs
+
+
+def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
+    try:
+        min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(","))
+        return min_lon, min_lat, max_lon, max_lat
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={"error_description": "bbox must be min_lon,min_lat,max_lon,max_lat"})
+
+
+# ---------------------------------------------------------------------------
+# GET /occupancy
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "",
+    response_model=list[OccupancyObservationResponse]
+                 | list[OccupancySeriesPoint]
+                 | list[OccupancyMapItem],
+)
+def list_occupancy(
+    current_user: Annotated[User, require("occupancy.view")],
+    db:           Annotated[Session, Depends(get_db)],
+    zone_id:      int    | None = None,
+    camera_id:    int    | None = None,
+    partner_id:   int    | None = None,
+    source_type:  str    | None = None,
+    from_:        str    | None = Query(None, alias="from"),
+    to:           str    | None = None,
+    at:           str    | None = None,
+    latest_only:  bool          = False,
+    bbox:         str    | None = None,
+    view:         str           = "observations",
+):
+    query = db.query(OccupancyObservation)
+
+    if zone_id is not None:
+        query = query.filter(OccupancyObservation.zone_id == zone_id)
+    if camera_id is not None:
+        query = query.filter(OccupancyObservation.camera_id == camera_id)
+    if partner_id is not None:
+        query = query.filter(OccupancyObservation.partner_id == partner_id)
+    if source_type is not None:
+        query = query.filter(OccupancyObservation.source_type == source_type)
+    if from_:
+        query = query.filter(OccupancyObservation.observed_at >= from_)
+    if to:
+        query = query.filter(OccupancyObservation.observed_at <= to)
+
+    # Для view=map и latest_only: последнее наблюдение по каждой зоне
+    if view == "map" or latest_only:
+        # Подзапрос: последний observed_at для каждой зоны
+        latest_sq = (
+            db.query(
+                OccupancyObservation.zone_id,
+                text("MAX(observed_at) AS max_obs"),
+            )
+            .group_by(OccupancyObservation.zone_id)
+            .subquery()
+        )
+
+        if at:
+            # При at=... — последнее наблюдение с observed_at <= at
+            latest_sq = (
+                db.query(
+                    OccupancyObservation.zone_id,
+                    text("MAX(observed_at) AS max_obs"),
+                )
+                .filter(OccupancyObservation.observed_at <= at)
+                .group_by(OccupancyObservation.zone_id)
+                .subquery()
+            )
+
+        query = query.join(
+            latest_sq,
+            (OccupancyObservation.zone_id == latest_sq.c.zone_id)
+            & (OccupancyObservation.observed_at == latest_sq.c.max_obs),
+        )
+
+    # bbox фильтр для view=map — через JOIN с parking_zones
+    if bbox and view == "map":
+        min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
+        query = query.join(
+            ParkingZone,
+            OccupancyObservation.zone_id == ParkingZone.parking_zone_id,
+        ).filter(
+            ParkingZone.longitude >= min_lon,
+            ParkingZone.latitude  >= min_lat,
+            ParkingZone.longitude <= max_lon,
+            ParkingZone.latitude  <= max_lat,
+        )
+
+    observations = query.order_by(OccupancyObservation.observed_at.desc()).all()
+
+    if view == "series":
+        return [
+            OccupancySeriesPoint(
+                observed_at=obs.observed_at,
+                occupied=obs.occupied,
+                free_count=_free_count(obs, db),
+                capacity=obs.capacity,
+                confidence=obs.confidence,
+                confidence_level=obs.confidence_level.value if obs.confidence_level else None,
+                source_type=obs.source_type,
+            )
+            for obs in observations
+        ]
+
+    if view == "map":
+        result = []
+        for obs in observations:
+            zone = db.query(ParkingZone).filter(
+                ParkingZone.parking_zone_id == obs.zone_id
+            ).one_or_none()
+            if zone is None:
+                continue
+            result.append(OccupancyMapItem(
+                zone_id=obs.zone_id,
+                camera_id=obs.camera_id,
+                capacity=obs.capacity,
+                occupied=obs.occupied,
+                free_count=_free_count(obs, db),
+                confidence=obs.confidence,
+                confidence_level=obs.confidence_level.value if obs.confidence_level else None,
+                observed_at=obs.observed_at,
+                geometry=zone.geometry,
+                pay=zone.pay,
+                zone_type=zone.zone_type.value,
+                location_type=zone.location_type.value if zone.location_type else None,
+                is_accessible=zone.is_accessible,
+                is_active=zone.is_active,
+            ))
+        return result
+
+    # view=observations (default)
+    return [_serialize_obs(obs, db) for obs in observations]
+
+
+# ---------------------------------------------------------------------------
+# POST /occupancy/new
+# ---------------------------------------------------------------------------
+
+@router.post("/new", status_code=status.HTTP_201_CREATED)
+def create_observation(
+    body:         CreateOccupancyRequest,
+    current_user: Annotated[User, require("occupancy.write")],
+    db:           Annotated[Session, Depends(get_db)],
+):
+    zone = db.query(ParkingZone).filter(
+        ParkingZone.parking_zone_id == body.zone_id
+    ).one_or_none()
+    if zone is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail={"error_description": "Zone not found"})
+
+    capacity = body.capacity if body.capacity is not None else zone.capacity
+
+    if body.occupied > capacity:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={"error_description": "Validation error: occupied must be between 0 and capacity"})
+
+    # Уникальность (source_type, source_ref) — только если source_ref задан
+    if body.source_ref:
+        conflict = db.query(OccupancyObservation).filter_by(
+            source_type=body.source_type, source_ref=body.source_ref
+        ).one_or_none()
+        if conflict:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                detail={"error_description": "Observation with this source_ref already exists"})
+
+    cl = _confidence_level(body.confidence)
+
+    obs = OccupancyObservation(
+        zone_id=body.zone_id,
+        camera_id=zone.camera_id,
+        partner_id=zone.partner_id,
+        source_type=body.source_type,
+        source_ref=body.source_ref,
+        capacity=capacity,
+        occupied=body.occupied,
+        confidence=body.confidence,
+        confidence_level=cl,
+        observed_at=body.observed_at,
+        ingested_at=datetime.now(timezone.utc),
+        metadata=body.metadata,
+        created_by_user_id=current_user.user_id,
+    )
+    db.add(obs)
+
+    # Обновляем денормализованные поля зоны, если наблюдение свежее
+    if zone.occupancy_updated_at is None or body.observed_at > zone.occupancy_updated_at:
+        zone.occupied = body.occupied
+        zone.confidence = body.confidence
+        zone.confidence_level = cl
+        zone.occupancy_updated_at = body.observed_at
+
+    db.commit()
+    db.refresh(obs)
+    return {"observation_id": obs.observation_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /occupancy/{observation_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/{observation_id}", response_model=OccupancyObservationResponse)
+def get_observation(
+    observation_id: int,
+    current_user:   Annotated[User, require("occupancy.view")],
+    db:             Annotated[Session, Depends(get_db)],
+):
+    return _serialize_obs(_get_obs_or_404(db, observation_id), db)
+
+
+# ---------------------------------------------------------------------------
+# PUT /occupancy/{observation_id}
+# ---------------------------------------------------------------------------
+
+@router.put("/{observation_id}", response_model=OccupancyObservationResponse)
+def update_observation(
+    observation_id: int,
+    body:           UpdateOccupancyRequest,
+    current_user:   Annotated[User, require("occupancy.write")],
+    db:             Annotated[Session, Depends(get_db)],
+):
+    obs = _get_obs_or_404(db, observation_id)
+
+    new_capacity = body.capacity if body.capacity is not None else obs.capacity
+    new_occupied = body.occupied if body.occupied is not None else obs.occupied
+
+    if new_occupied > new_capacity:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={"error_description": "Validation error: occupied must be between 0 and capacity"})
+
+    if body.capacity is not None:
+        obs.capacity = body.capacity
+    if body.occupied is not None:
+        obs.occupied = body.occupied
+    if body.confidence is not None:
+        obs.confidence = body.confidence
+        obs.confidence_level = _confidence_level(body.confidence)
+    if body.observed_at is not None:
+        obs.observed_at = body.observed_at
+    if body.source_ref is not None:
+        obs.source_ref = body.source_ref
+    if body.metadata is not None:
+        obs.metadata = body.metadata
+
+    db.commit()
+    db.refresh(obs)
+    return _serialize_obs(obs, db)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /occupancy/{observation_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/{observation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_observation(
+    observation_id: int,
+    current_user:   Annotated[User, require("occupancy.delete")],
+    db:             Annotated[Session, Depends(get_db)],
+):
+    obs = _get_obs_or_404(db, observation_id)
+    db.delete(obs)
+    db.commit()
+    return None

@@ -1,7 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import auth, users, partners, cameras, zones, admin, sources
+from .routers import auth, users, partners, cameras, zones, admin, sources, occupancy, forecasts
 from .database import engine
 from .db_models import Base
 
@@ -46,6 +46,8 @@ app.include_router(cameras.router,  prefix=PREFIX)
 app.include_router(zones.router,    prefix=PREFIX)
 app.include_router(admin.router,    prefix=PREFIX)
 app.include_router(sources.router,  prefix=PREFIX)
+app.include_router(occupancy.router,prefix=PREFIX)
+app.include_router(forecasts.router,prefix=PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +70,10 @@ def health(db: Annotated[Session, Depends(get_db)]):
     except Exception:
         db_status = "disconnected"
         api_status = "degraded"
+
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"status": api_status, "database": db_status})
     return {"status": api_status, "database": db_status}
 
 

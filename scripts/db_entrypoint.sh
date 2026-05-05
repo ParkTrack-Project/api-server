@@ -7,7 +7,7 @@ TEST_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-p
 
 echo "test0"
 
-psql "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable" \
+psql "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:5432/postgres?sslmode=disable" \
 -v ON_ERROR_STOP=1 <<SQL
 DROP DATABASE IF EXISTS ${POSTGRES_TEST_DB} WITH (FORCE);
 CREATE DATABASE ${POSTGRES_TEST_DB};

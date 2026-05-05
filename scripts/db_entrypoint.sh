@@ -19,8 +19,8 @@ echo "Starting seqwall staircase test"
 seqwall staircase \
 --postgres-url "$TEST_DB_URL" \
 --migrations-path ./migrations/up \
---upgrade "bash scripts/ci-up-one.sh {current_migration}" \
---downgrade "bash scripts/ci-down-one.sh {current_migration}"
+--upgrade "bash scripts/ci-up-one.sh {current_migration} \"$TEST_DB_URL\"" \
+--downgrade "bash scripts/ci-down-one.sh {current_migration} \"$TEST_DB_URL\""
 
 echo "Applying target migration"
 

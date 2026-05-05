@@ -59,7 +59,7 @@ def _serialize_obs(obs: OccupancyObservation, db: Session) -> OccupancyObservati
         confidence_level=obs.confidence_level.value if obs.confidence_level else None,
         observed_at=obs.observed_at,
         ingested_at=obs.ingested_at,
-        metadata=obs.metadata,
+        metadata=obs.metadata_json,
         created_by_user_id=obs.created_by_user_id,
     )
 
@@ -257,7 +257,7 @@ def create_observation(
         confidence_level=cl,
         observed_at=body.observed_at,
         ingested_at=datetime.now(timezone.utc),
-        metadata=body.metadata,
+        metadata_json=body.metadata,
         created_by_user_id=current_user.user_id,
     )
     db.add(obs)
@@ -319,7 +319,7 @@ def update_observation(
     if body.source_ref is not None:
         obs.source_ref = body.source_ref
     if body.metadata is not None:
-        obs.metadata = body.metadata
+        obs.metadata_json = body.metadata
 
     db.commit()
     db.refresh(obs)

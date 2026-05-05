@@ -59,7 +59,7 @@ def _serialize(f: Forecast, db: Session) -> ForecastPointResponse:
         probability_free_space=f.probability_free_space,
         confidence=f.confidence,
         confidence_level=f.confidence_level.value if f.confidence_level else None,
-        metadata=f.metadata,
+        metadata=f.metadata_json,
         created_by_user_id=f.created_by_user_id,
     )
 
@@ -273,7 +273,7 @@ def create_forecast(
         probability_free_space=body.probability_free_space,
         confidence=body.confidence,
         confidence_level=_confidence_level(body.confidence),
-        metadata=body.metadata,
+        metadata_json=body.metadata,
         created_by_user_id=current_user.user_id,
     )
     db.add(f)
@@ -331,7 +331,7 @@ def update_forecast(
         f.confidence = body.confidence
         f.confidence_level = _confidence_level(body.confidence)
     if body.metadata is not None:
-        f.metadata = body.metadata
+        f.metadata_json = body.metadata
 
     db.commit()
     db.refresh(f)

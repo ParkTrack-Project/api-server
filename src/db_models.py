@@ -294,7 +294,7 @@ class OccupancyObservation(Base):
                                      create_type=False), nullable=True)
     observed_at        = Column(DateTime(timezone=True), nullable=False)
     ingested_at        = Column(DateTime(timezone=True), default=_now)
-    metadata           = Column(JSONB, nullable=True)
+    metadata_json      = Column("metadata", JSONB, nullable=True)
     created_by_user_id = Column(Integer, ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
 
     zone       = relationship("ParkingZone", foreign_keys=[zone_id])
@@ -332,7 +332,7 @@ class Forecast(Base):
     confidence             = Column(Double, nullable=False)
     confidence_level       = Column(Enum(ConfidenceLevel, name="confidence_level_types",
                                          create_type=False), nullable=True)
-    metadata               = Column(JSONB, nullable=True)
+    metadata_json          = Column("metadata", JSONB, nullable=True)
     created_by_user_id     = Column(Integer, ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
 
     zone       = relationship("ParkingZone", foreign_keys=[zone_id])

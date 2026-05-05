@@ -13,7 +13,7 @@ DROP DATABASE IF EXISTS ${POSTGRES_TEST_DB} WITH (FORCE);
 CREATE DATABASE ${POSTGRES_TEST_DB};
 SQL
 
-echo "test1"
+echo "Starting seqwall staircase test"
 
 seqwall staircase \
 --postgres-url "$TEST_DB_URL" \
@@ -21,7 +21,7 @@ seqwall staircase \
 --upgrade "bash scripts/ci-up-one.sh {current_migration}" \
 --downgrade "bash scripts/ci-down-one.sh {current_migration}"
 
-echo "test2"
+echo "Applying target migration"
 
 if [ -n "${MIGRATION_VERSION:-}" ]; then
 	migrate -path ./migrations -database "$MAIN_DB_URL" goto "$MIGRATION_VERSION"

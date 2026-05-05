@@ -2,12 +2,13 @@
 
 set -euo pipefail
 
+DATABASES_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/postgres?sslmode=disable"
 MAIN_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}?sslmode=disable"
 TEST_DB_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_TEST_DB}?sslmode=disable"
 
 echo "Recreating database"
 
-psql "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:5432/postgres?sslmode=disable" \
+psql "$DATABASES_DB_URL" \
 -v ON_ERROR_STOP=1 <<SQL
 DROP DATABASE IF EXISTS ${POSTGRES_TEST_DB} WITH (FORCE);
 CREATE DATABASE ${POSTGRES_TEST_DB};

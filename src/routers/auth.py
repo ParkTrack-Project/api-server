@@ -12,6 +12,7 @@ from ..dependencies import (
     CurrentUser,
     create_access_token,
     get_effective_permissions,
+    get_membership_permissions,
     hash_password,
     require,
     verify_password,
@@ -38,7 +39,7 @@ def _build_token_response(user: User, db: Session) -> TokenResponse:
         PartnerMembershipInfo(
             partner_id=m.partner_id,
             role=m.user_role,
-            permissions=[],
+            permissions=sorted(get_membership_permissions(m)),
             read_scope=m.read_scope,
             write_scope=m.write_scope,
             delete_scope=m.delete_scope,
@@ -135,9 +136,7 @@ def me(current_user: Annotated[User, require("users.me.view")]):
         PartnerMembershipInfo(
             partner_id=m.partner_id,
             role=m.user_role,
-            # permissions партнёрского членства не хранятся в БД отдельно —
-            # возвращаем пустой список; расширить при необходимости
-            permissions=[],
+            permissions=sorted(get_membership_permissions(m)),
             read_scope=m.read_scope,
             write_scope=m.write_scope,
             delete_scope=m.delete_scope,

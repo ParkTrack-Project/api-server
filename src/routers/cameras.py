@@ -10,7 +10,7 @@ from PIL import Image
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, Partner, User
+from ..db_models import Camera, GlobalRole, Partner, User
 from ..dependencies import CurrentUser, require
 from ..schemas.cameras import (
     CameraMapItemResponse,
@@ -73,6 +73,51 @@ def _get_camera_or_404(db: Session, camera_id: int) -> Camera:
     return camera
 
 
+def _active_partner_ids(user: User) -> set[int]:
+    return {
+        membership.partner_id
+        for membership in user.memberships
+        if getattr(membership.partner, "is_active", True)
+    }
+
+
+def _has_global_camera_access(user: User) -> bool:
+    return user.global_role == GlobalRole.admin
+
+
+def _scope_camera_query(query, user: User):
+    if _has_global_camera_access(user):
+        return query
+    partner_ids = _active_partner_ids(user)
+    if not partner_ids:
+        return query.filter(Camera.camera_id.in_([]))
+    return query.filter(Camera.partner_id.in_(partner_ids))
+
+
+def _ensure_camera_visible(camera: Camera, user: User):
+    if _has_global_camera_access(user):
+        return
+    if camera.partner_id not in _active_partner_ids(user):
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            detail={"error_description": "Camera not found"})
+
+
+def _normalize_partner_id_for_camera(body: CreateCameraRequest, user: User) -> int | None:
+    if _has_global_camera_access(user):
+        return body.partner_id
+
+    partner_ids = _active_partner_ids(user)
+    if body.partner_id is None:
+        if len(partner_ids) == 1:
+            return next(iter(partner_ids))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail={"error_description": "partner_id is required for partner camera creation"})
+    if body.partner_id not in partner_ids:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            detail={"error_description": "Cannot manage cameras for this partner"})
+    return body.partner_id
+
+
 # ---------------------------------------------------------------------------
 # GET /cameras
 # ---------------------------------------------------------------------------
@@ -87,7 +132,7 @@ def list_cameras(
     bbox:       str   | None = None,   # "min_lon,min_lat,max_lon,max_lat"
     view:       str          = "full",
 ):
-    query = db.query(Camera)
+    query = _scope_camera_query(db.query(Camera), current_user)
 
     if q:
         query = query.filter(Camera.title.icontains(q))
@@ -159,8 +204,10 @@ def create_camera(
         raise HTTPException(status.HTTP_409_CONFLICT,
                             detail={"error_description": "Camera with this title already exists"})
 
-    if body.partner_id is not None:
-        if not db.query(Partner).filter(Partner.partner_id == body.partner_id).one_or_none():
+    partner_id = _normalize_partner_id_for_camera(body, current_user)
+
+    if partner_id is not None:
+        if not db.query(Partner).filter(Partner.partner_id == partner_id).one_or_none():
             raise HTTPException(status.HTTP_404_NOT_FOUND,
                                 detail={"error_description": "Partner not found"})
 
@@ -172,7 +219,7 @@ def create_camera(
         calib=body.calib,
         latitude=body.latitude,
         longitude=body.longitude,
-        partner_id=body.partner_id,
+        partner_id=partner_id,
         created_by_user_id=current_user.user_id,
         is_active=True,
     )
@@ -192,7 +239,9 @@ def get_camera(
     current_user: Annotated[User, require("cameras.view")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    return _serialize(_get_camera_or_404(db, camera_id))
+    camera = _get_camera_or_404(db, camera_id)
+    _ensure_camera_visible(camera, current_user)
+    return _serialize(camera)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +256,13 @@ def update_camera(
     db: Annotated[Session, Depends(get_db)],
 ):
     camera = _get_camera_or_404(db, camera_id)
+    _ensure_camera_visible(camera, current_user)
 
     update_data = body.model_dump(exclude_none=True)
+    if "partner_id" in update_data and not _has_global_camera_access(current_user):
+        if update_data["partner_id"] not in _active_partner_ids(current_user):
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                detail={"error_description": "Cannot manage cameras for this partner"})
     for field, value in update_data.items():
         setattr(camera, field, value)
 
@@ -228,6 +282,7 @@ def delete_camera(
     db: Annotated[Session, Depends(get_db)],
 ):
     camera = _get_camera_or_404(db, camera_id)
+    _ensure_camera_visible(camera, current_user)
     db.delete(camera)
     db.commit()
     return None
@@ -246,6 +301,7 @@ def get_snapshot(
     fallback_to_raw: bool = False,
 ):
     camera = _get_camera_or_404(db, camera_id)
+    _ensure_camera_visible(camera, current_user)
 
     # annotated-снапшот здесь не реализован (нет CV pipeline) — fallback к raw
     cap = cv2.VideoCapture(camera.source)

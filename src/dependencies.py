@@ -31,8 +31,12 @@ JWT_EXPIRE_SECONDS: int = int(os.environ.get("JWT_EXPIRE_SECONDS", 86400))  # 24
 # ---------------------------------------------------------------------------
 # Хэширование паролей
 # ---------------------------------------------------------------------------
+#
+# Связка passlib 1.7.x + bcrypt 5.x нестабильна на части окружений
+# (в том числе локально на Windows/Python 3.13). Для backend MVP используем
+# встроенный в passlib PBKDF2 backend, которому не нужен внешний bcrypt-модуль.
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 
 def hash_password(plain: str) -> str:

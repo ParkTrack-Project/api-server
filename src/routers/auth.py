@@ -42,6 +42,7 @@ def _build_token_response(user: User, db: Session) -> TokenResponse:
             read_scope=m.read_scope,
             write_scope=m.write_scope,
             delete_scope=m.delete_scope,
+            is_active=True,
         )
         for m in user.memberships
     ]
@@ -140,6 +141,7 @@ def me(current_user: Annotated[User, require("users.me.view")]):
             read_scope=m.read_scope,
             write_scope=m.write_scope,
             delete_scope=m.delete_scope,
+            is_active=True,
         )
         for m in current_user.memberships
     ]

@@ -24,6 +24,7 @@ app.add_middleware(
     allow_origins=[
         "https://swagger.parktrack.live",
         "https://labeler.parktrack.live",
+        "https://admin.parktrack.live",
         "https://parktrack.live",
         "http://localhost:5173",
         "http://127.0.0.1:5173"

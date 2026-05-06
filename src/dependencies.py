@@ -103,6 +103,17 @@ BASE_ADMIN_PERMISSIONS: frozenset[str] = frozenset({
     "admin.system.manage",
     "admin.monitoring.view",
     "admin.analytics.view",
+    "cameras.view",
+    "cameras.create",
+    "cameras.update",
+    "cameras.delete",
+    "zones.create",
+    "zones.update",
+    "zones.delete",
+    "partner_members.view",
+    "partner_members.invite",
+    "partner_members.update",
+    "partner_members.disable",
     # Плюс все права обычного пользователя
     *BASE_USER_PERMISSIONS,
 })

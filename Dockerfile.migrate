@@ -11,6 +11,7 @@ COPY --from=seqwall-builder /go/bin/seqwall /usr/local/bin/seqwall
 WORKDIR /app
 COPY migrations ./migrations
 COPY scripts ./scripts
-RUN chmod +x ./scripts/*.sh
+RUN sed -i 's/\r$//' ./scripts/*.sh \
+ && chmod +x ./scripts/*.sh
 
 ENTRYPOINT [ "bash", "./scripts/db_entrypoint.sh" ]

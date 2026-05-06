@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -135,8 +135,8 @@ def list_forecasts(
         # Выбираем прогноз с predicted_for ближайшим к at (не позже чем at + 30 мин)
         latest_sq = (
             db.query(
-                Forecast.zone_id,
-                text("MAX(generated_at) AS max_gen"),
+                Forecast.zone_id.label("zone_id"),
+                func.max(Forecast.generated_at).label("max_gen"),
             )
             .filter(Forecast.predicted_for <= at)
             .group_by(Forecast.zone_id)
@@ -164,9 +164,9 @@ def list_forecasts(
     elif latest_model_only:
         latest_sq = (
             db.query(
-                Forecast.zone_id,
-                Forecast.predicted_for,
-                text("MAX(generated_at) AS max_gen"),
+                Forecast.zone_id.label("zone_id"),
+                Forecast.predicted_for.label("predicted_for"),
+                func.max(Forecast.generated_at).label("max_gen"),
             )
             .group_by(Forecast.zone_id, Forecast.predicted_for)
             .subquery()

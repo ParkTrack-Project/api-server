@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import GlobalRole, User
-from ..dependencies import CurrentUser, hash_password, require, verify_password
+from ..db_models import GlobalRole, Partner, PartnerMembership, User
+from ..dependencies import CurrentUser, get_effective_permissions, hash_password, require, verify_password
 from ..schemas.users import (
     AdminUpdateUserRequest,
     UpdatePasswordRequest,
@@ -20,6 +20,53 @@ from ..schemas.users import (
 )
 
 router = APIRouter(prefix="/users", tags=["Users"])
+
+
+def _active_partner_ids(user: User) -> set[int]:
+    return {
+        membership.partner_id
+        for membership in user.memberships
+        if getattr(membership.partner, "is_active", True)
+    }
+
+
+def _ensure_can_view_users(current_user: User) -> bool:
+    permissions = get_effective_permissions(current_user)
+    if "admin.users.view" in permissions:
+        return True
+    if "partner_members.view" in permissions:
+        return False
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={"error_description": "Missing permissions: admin.users.view or partner_members.view"},
+    )
+
+
+def _scope_users_query(query, current_user: User, has_global_access: bool):
+    if has_global_access:
+        return query
+
+    partner_ids = _active_partner_ids(current_user)
+    if not partner_ids:
+        return query.filter(User.user_id.in_([]))
+
+    return (
+        query
+        .join(PartnerMembership, PartnerMembership.user_id == User.user_id)
+        .filter(PartnerMembership.partner_id.in_(partner_ids))
+        .distinct()
+    )
+
+
+def _ensure_user_visible(user: User, current_user: User, has_global_access: bool):
+    if has_global_access:
+        return
+    partner_ids = _active_partner_ids(current_user)
+    if not any(membership.partner_id in partner_ids for membership in user.memberships):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "User not found"},
+        )
 
 
 def _serialize(user: User) -> UserResponse:
@@ -42,14 +89,15 @@ def _serialize(user: User) -> UserResponse:
 
 @router.get("", response_model=UserListResponse)
 def list_users(
-    current_user: Annotated[User, require("admin.users.view")],
+    current_user: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
     q:        str  | None = None,
     is_active: bool | None = None,
     top:      int = 20,
     offset:   int = 0,
 ):
-    query = db.query(User)
+    has_global_access = _ensure_can_view_users(current_user)
+    query = _scope_users_query(db.query(User), current_user, has_global_access)
     if q:
         query = query.filter(User.email.icontains(q) | User.full_name.icontains(q))
     if is_active is not None:
@@ -69,11 +117,6 @@ def list_users(
 # ---------------------------------------------------------------------------
 # GET /users/me
 # ---------------------------------------------------------------------------
-
-# routers/users.py
-
-from ..db_models import Partner, PartnerMembership  # if not already imported
-from ..schemas.users import UserProfile, PartnerMembershipInfo
 
 @router.get("/me", response_model=UserProfile)
 def get_me(
@@ -156,13 +199,15 @@ def change_password(
 @router.get("/{user_id}", response_model=UserResponse)
 def get_user(
     user_id: int,
-    current_user: Annotated[User, require("admin.users.view")],
+    current_user: CurrentUser,
     db: Annotated[Session, Depends(get_db)],
 ):
+    has_global_access = _ensure_can_view_users(current_user)
     user = db.query(User).filter(User.user_id == user_id).one_or_none()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail={"error_description": "User not found"})
+    _ensure_user_visible(user, current_user, has_global_access)
     return _serialize(user)
 
 

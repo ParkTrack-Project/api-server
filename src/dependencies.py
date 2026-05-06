@@ -18,7 +18,7 @@ from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .db_models import GlobalRole, User, UserPermission
+from .db_models import GlobalRole, PartnerMembership, User, UserPermission
 
 # ---------------------------------------------------------------------------
 # Конфигурация JWT
@@ -118,15 +118,79 @@ BASE_ADMIN_PERMISSIONS: frozenset[str] = frozenset({
     *BASE_USER_PERMISSIONS,
 })
 
+PARTNER_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
+    "partner_owner": frozenset({
+        "sources.view",
+        "cameras.view",
+        "cameras.create",
+        "cameras.update",
+        "cameras.delete",
+        "zones.view",
+        "zones.create",
+        "zones.update",
+        "zones.delete",
+        "partner_members.view",
+        "partner_members.invite",
+        "partner_members.update",
+        "partner_members.disable",
+        "partner_access.manage",
+    }),
+    "partner_admin": frozenset({
+        "sources.view",
+        "cameras.view",
+        "cameras.create",
+        "cameras.update",
+        "cameras.delete",
+        "zones.view",
+        "zones.create",
+        "zones.update",
+        "zones.delete",
+        "partner_members.view",
+        "partner_members.invite",
+        "partner_members.update",
+        "partner_members.disable",
+        "partner_access.manage",
+    }),
+    "partner_manager": frozenset({
+        "sources.view",
+        "cameras.view",
+        "cameras.create",
+        "cameras.update",
+        "zones.view",
+        "zones.create",
+        "zones.update",
+        "partner_members.view",
+    }),
+    "partner_analyst": frozenset({
+        "sources.view",
+        "cameras.view",
+        "zones.view",
+    }),
+    "partner_viewer": frozenset({
+        "sources.view",
+        "cameras.view",
+        "zones.view",
+    }),
+}
+
+
+def get_membership_permissions(membership: PartnerMembership) -> set[str]:
+    return set(PARTNER_ROLE_PERMISSIONS.get(membership.user_role, frozenset()))
+
 
 def get_effective_permissions(user: User) -> set[str]:
     """
     Возвращает эффективный набор прав пользователя:
-    базовые (по роли) + дополнительные из user_permissions.
+    базовые (по роли) + дополнительные из user_permissions + права партнёрских ролей.
     """
     base = BASE_ADMIN_PERMISSIONS if user.global_role == GlobalRole.admin else BASE_USER_PERMISSIONS
     extra = {p.permission for p in user.permissions}
-    return base | extra
+    partner_permissions: set[str] = set()
+    for membership in user.memberships:
+        partner_is_active = getattr(membership.partner, "is_active", True)
+        if partner_is_active:
+            partner_permissions |= get_membership_permissions(membership)
+    return base | extra | partner_permissions
 
 
 # ---------------------------------------------------------------------------

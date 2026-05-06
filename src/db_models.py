@@ -346,3 +346,48 @@ class Forecast(Base):
 
     def __repr__(self) -> str:
         return f"<Forecast id={self.forecast_id} zone_id={self.zone_id} for={self.predicted_for}>"
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+class RouteStatus(str, enum.Enum):
+    active    = "active"
+    completed = "completed"
+    cancelled = "cancelled"
+    replaced  = "replaced"
+
+
+class RouteMode(str, enum.Enum):
+    find_parking        = "find_parking"
+    route_to_destination = "route_to_destination"
+
+
+class Route(Base):
+    __tablename__ = "routes"
+
+    route_id              = Column(Integer, primary_key=True, autoincrement=True)
+    user_id               = Column(Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False)
+    mode                  = Column(Enum(RouteMode,   name="route_modes"),   nullable=False)
+    provider              = Column(String(50), nullable=False, default="internal")
+    origin_latitude       = Column(Double, nullable=False)
+    origin_longitude      = Column(Double, nullable=False)
+    destination_latitude  = Column(Double, nullable=True)
+    destination_longitude = Column(Double, nullable=True)
+    selected_zone_id      = Column(Integer, ForeignKey("parking_zones.parking_zone_id",
+                                                        ondelete="SET NULL"), nullable=True)
+    selected_candidate    = Column(JSONB, nullable=True)   # снапшот RouteCandidate
+    eta_seconds           = Column(Integer, nullable=True)
+    arrival_time          = Column(DateTime(timezone=True), nullable=True)
+    polyline              = Column(Text, nullable=True)
+    deeplink_url          = Column(Text, nullable=True)
+    status                = Column(Enum(RouteStatus, name="route_statuses"),
+                                   nullable=False, default=RouteStatus.active)
+    created_at            = Column(DateTime(timezone=True), default=_now)
+    updated_at            = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    user          = relationship("User",        foreign_keys=[user_id])
+    selected_zone = relationship("ParkingZone", foreign_keys=[selected_zone_id])
+
+    def __repr__(self) -> str:
+        return f"<Route id={self.route_id} user_id={self.user_id} status={self.status}>"

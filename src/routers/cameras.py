@@ -10,7 +10,7 @@ from PIL import Image
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, GlobalRole, Partner, User
+from ..db_models import Camera, GlobalRole, Partner, User, DataSource
 from ..dependencies import CurrentUser, require
 from ..schemas.cameras import (
     CameraMapItemResponse,
@@ -224,8 +224,22 @@ def create_camera(
         is_active=True,
     )
     db.add(camera)
+    db.flush()
+
+    source = DataSource(
+        partner_id=camera.partner_id,
+        created_by_user_id=current_user.user_id,
+        source_type="camera_stream",
+        entity_type="camera",
+        entity_id=camera.camera_id,
+        title=camera.title,
+        status="active",
+        is_active=True,
+    )
+    db.add(source)
     db.commit()
     db.refresh(camera)
+
     return {"camera_id": camera.camera_id}
 
 

@@ -268,11 +268,6 @@ class DataSource(Base):
         UniqueConstraint("entity_type", "entity_id", name="uq_source_entity"),
     )
 
-"""
-Дополнение к db_models.py — модели OccupancyObservation и Forecast.
-Добавь этот блок в конец существующего src/db_models.py.
-"""
-
 # ---------------------------------------------------------------------------
 # Occupancy Observations
 # ---------------------------------------------------------------------------

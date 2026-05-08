@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -122,26 +122,23 @@ def list_occupancy(
     if to:
         query = query.filter(OccupancyObservation.observed_at <= to)
 
-    # Для view=map и latest_only: последнее наблюдение по каждой зоне
     if view == "map" or latest_only:
-        # Подзапрос: последний observed_at для каждой зоны
-        latest_sq = (
-            db.query(
-                OccupancyObservation.zone_id,
-                text("MAX(observed_at) AS max_obs"),
-            )
-            .group_by(OccupancyObservation.zone_id)
-            .subquery()
-        )
-
         if at:
-            # При at=... — последнее наблюдение с observed_at <= at
             latest_sq = (
                 db.query(
-                    OccupancyObservation.zone_id,
-                    text("MAX(observed_at) AS max_obs"),
+                    OccupancyObservation.zone_id.label("zone_id"),
+                    func.max(OccupancyObservation.observed_at).label("max_obs"),
                 )
                 .filter(OccupancyObservation.observed_at <= at)
+                .group_by(OccupancyObservation.zone_id)
+                .subquery()
+            )
+        else:
+            latest_sq = (
+                db.query(
+                    OccupancyObservation.zone_id.label("zone_id"),
+                    func.max(OccupancyObservation.observed_at).label("max_obs"),
+                )
                 .group_by(OccupancyObservation.zone_id)
                 .subquery()
             )
@@ -151,7 +148,6 @@ def list_occupancy(
             (OccupancyObservation.zone_id == latest_sq.c.zone_id)
             & (OccupancyObservation.observed_at == latest_sq.c.max_obs),
         )
-
     # bbox фильтр для view=map — через JOIN с parking_zones
     if bbox and view == "map":
         min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)

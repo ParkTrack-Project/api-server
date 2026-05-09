@@ -148,18 +148,21 @@ def list_occupancy(
             (OccupancyObservation.zone_id == latest_sq.c.zone_id)
             & (OccupancyObservation.observed_at == latest_sq.c.max_obs),
         )
-    # bbox фильтр для view=map — через JOIN с parking_zones
+        
     if bbox and view == "map":
         min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
-        query = query.join(
-            ParkingZone,
-            OccupancyObservation.zone_id == ParkingZone.parking_zone_id,
-        ).filter(
-            ParkingZone.longitude >= min_lon,
-            ParkingZone.latitude  >= min_lat,
-            ParkingZone.longitude <= max_lon,
-            ParkingZone.latitude  <= max_lat,
-        )
+        zone_ids_in_bbox = []
+        zones = db.query(ParkingZone).all()
+        for z in zones:
+            try:
+                coords = z.geometry["coordinates"][0]
+                z_lon = sum(c[0] for c in coords) / len(coords)
+                z_lat = sum(c[1] for c in coords) / len(coords)
+                if min_lon <= z_lon <= max_lon and min_lat <= z_lat <= max_lat:
+                    zone_ids_in_bbox.append(z.parking_zone_id)
+            except Exception:
+                pass
+        query = query.filter(OccupancyObservation.zone_id.in_(zone_ids_in_bbox))
 
     observations = query.order_by(OccupancyObservation.observed_at.desc()).all()
 

@@ -26,6 +26,8 @@ app.add_middleware(
         "https://labeler.parktrack.live",
         "https://admin.parktrack.live",
         "https://parktrack.live",
+        "https://dev.parktrack.live",
+        "https://admin.dev.parktrack.live",
         "http://localhost:5173",
         "http://127.0.0.1:5173"
     ],

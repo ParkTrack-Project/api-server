@@ -4,12 +4,13 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..db_models import Camera, ParkingZone, Partner, User
-from ..dependencies import CurrentUser, require
+from ..dependencies import CurrentUser, get_current_user, require
 from ..schemas.zones import (
     CreateZoneRequest,
     UpdateZoneRequest,
@@ -90,7 +91,6 @@ def _get_zone_or_404(db: Session, zone_id: int) -> ParkingZone:
 
 @router.get("", response_model=list[ZoneResponse] | list[ZoneMapItemResponse])
 def list_zones(
-    current_user: Annotated[User, require("zones.view")],
     db: Annotated[Session, Depends(get_db)],
     camera_id:      int   | None = None,
     partner_id:     int   | None = None,
@@ -101,7 +101,28 @@ def list_zones(
     view:           str          = "full",
     top:            int          = 100,
     offset:         int          = 0,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(HTTPBearer(auto_error=False))] = None,
 ):
+    if view != "map":
+        if credentials is None:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                detail={"error_description": "Missing or invalid access token"},
+            )
+        from ..dependencies import decode_access_token, get_effective_permissions
+        user_id = decode_access_token(credentials.credentials)
+        current_user = db.query(User).filter(User.user_id == user_id).one_or_none()
+        if current_user is None or not current_user.is_active:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                detail={"error_description": "User not found or inactive"},
+            )
+        if "zones.view" not in get_effective_permissions(current_user):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail={"error_description": "Missing permissions: zones.view"},
+            )
+
     query = db.query(ParkingZone)
 
     if camera_id is not None:
@@ -113,7 +134,6 @@ def list_zones(
     if max_pay is not None:
         query = query.filter(ParkingZone.pay <= max_pay)
     if min_free_count is not None:
-        # free_count — вычисляемое поле, фильтруем через выражение
         query = query.filter(
             (ParkingZone.capacity - ParkingZone.occupied) >= min_free_count
         )

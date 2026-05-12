@@ -3,8 +3,12 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import smtplib
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formataddr
 from typing import Annotated
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -37,7 +41,16 @@ from ..schemas.auth import (
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 PASSWORD_RESET_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TTL_MINUTES", "30"))
-PASSWORD_RESET_RETURN_TOKEN = os.environ.get("PASSWORD_RESET_RETURN_TOKEN", "1").lower() in {"1", "true", "yes", "on"}
+PASSWORD_RESET_LOGIN_URL = os.environ.get("PASSWORD_RESET_LOGIN_URL", "http://localhost:5173/#/login")
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ParkTrack")
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1").lower() in {"1", "true", "yes", "on"}
+SMTP_USE_SSL = os.environ.get("SMTP_USE_SSL", "0").lower() in {"1", "true", "yes", "on"}
+_PASSWORD_RESET_RETURN_TOKEN = os.environ.get("PASSWORD_RESET_RETURN_TOKEN")
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,57 @@ def _is_expired(dt: datetime) -> bool:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt <= datetime.now(timezone.utc)
+
+
+def _smtp_enabled() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+
+
+def _should_return_reset_token() -> bool:
+    if _PASSWORD_RESET_RETURN_TOKEN is None:
+        return not _smtp_enabled()
+    return _PASSWORD_RESET_RETURN_TOKEN.lower() in {"1", "true", "yes", "on"}
+
+
+def _build_password_reset_link(token: str, email: str) -> str:
+    separator = "&" if "?" in PASSWORD_RESET_LOGIN_URL else "?"
+    return f"{PASSWORD_RESET_LOGIN_URL}{separator}{urlencode({'reset_token': token, 'email': email})}"
+
+
+def _send_password_reset_email(email: str, token: str) -> bool:
+    if not _smtp_enabled():
+        return False
+
+    reset_link = _build_password_reset_link(token, email)
+    message = EmailMessage()
+    message["Subject"] = "Сброс пароля ParkTrack"
+    message["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM_EMAIL)) if SMTP_FROM_NAME else SMTP_FROM_EMAIL
+    message["To"] = email
+    message.set_content(
+        "Вы запросили сброс пароля ParkTrack.\n\n"
+        f"Ссылка для сброса: {reset_link}\n\n"
+        f"Reset-token: {token}\n\n"
+        f"Токен действует {PASSWORD_RESET_TTL_MINUTES} минут. "
+        "Если вы не запрашивали сброс пароля, просто проигнорируйте это письмо.\n"
+    )
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                if SMTP_USERNAME:
+                    smtp.login(SMTP_USERNAME, SMTP_PASSWORD or "")
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                if SMTP_USE_TLS:
+                    smtp.starttls()
+                if SMTP_USERNAME:
+                    smtp.login(SMTP_USERNAME, SMTP_PASSWORD or "")
+                smtp.send_message(message)
+        return True
+    except Exception as exc:
+        print(f"Password reset email failed: {exc}")
+        return False
 
 # ---------------------------------------------------------------------------
 # POST /auth/register
@@ -152,10 +216,11 @@ def request_password_reset(body: PasswordResetRequest, db: Annotated[Session, De
         )
         db.add(token)
         db.commit()
+        _send_password_reset_email(user.email, raw_token)
 
     return PasswordResetRequestResponse(
         ok=True,
-        reset_token=raw_token if PASSWORD_RESET_RETURN_TOKEN else None,
+        reset_token=raw_token if raw_token and _should_return_reset_token() else None,
     )
 
 

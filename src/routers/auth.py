@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import GlobalRole, User
+from ..db_models import GlobalRole, PasswordResetToken, User
 from ..dependencies import (
     JWT_EXPIRE_SECONDS,
     CurrentUser,
@@ -22,11 +26,18 @@ from ..schemas.auth import (
     LoginRequest,
     MeResponse,
     PartnerMembershipInfo,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
     RegisterRequest,
     TokenResponse,
 )
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+PASSWORD_RESET_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TTL_MINUTES", "30"))
+PASSWORD_RESET_RETURN_TOKEN = os.environ.get("PASSWORD_RESET_RETURN_TOKEN", "1").lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +72,16 @@ def _build_token_response(user: User, db: Session) -> TokenResponse:
             partner_memberships=memberships,
         ),
     )
+
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_expired(dt: datetime) -> bool:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt <= datetime.now(timezone.utc)
 
 # ---------------------------------------------------------------------------
 # POST /auth/register
@@ -111,6 +132,63 @@ def login(body: LoginRequest, db: Annotated[Session, Depends(get_db)]):
         )
 
     return _build_token_response(user, db)
+
+
+# ---------------------------------------------------------------------------
+# POST /auth/password-reset/request
+# ---------------------------------------------------------------------------
+
+@router.post("/password-reset/request", status_code=status.HTTP_200_OK, response_model=PasswordResetRequestResponse)
+def request_password_reset(body: PasswordResetRequest, db: Annotated[Session, Depends(get_db)]):
+    user = db.query(User).filter(User.email == body.email).one_or_none()
+    raw_token: str | None = None
+
+    if user is not None and user.is_active:
+        raw_token = secrets.token_urlsafe(32)
+        token = PasswordResetToken(
+            user_id=user.user_id,
+            token_hash=_hash_reset_token(raw_token),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_TTL_MINUTES),
+        )
+        db.add(token)
+        db.commit()
+
+    return PasswordResetRequestResponse(
+        ok=True,
+        reset_token=raw_token if PASSWORD_RESET_RETURN_TOKEN else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /auth/password-reset/confirm
+# ---------------------------------------------------------------------------
+
+@router.post("/password-reset/confirm", status_code=status.HTTP_200_OK, response_model=PasswordResetConfirmResponse)
+def confirm_password_reset(body: PasswordResetConfirmRequest, db: Annotated[Session, Depends(get_db)]):
+    token = (
+        db.query(PasswordResetToken)
+        .filter(PasswordResetToken.token_hash == _hash_reset_token(body.token))
+        .one_or_none()
+    )
+
+    if token is None or token.used_at is not None or _is_expired(token.expires_at):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error_description": "Reset token is invalid or expired"},
+        )
+
+    user = db.query(User).filter(User.user_id == token.user_id).one_or_none()
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error_description": "Reset token is invalid or expired"},
+        )
+
+    user.hashed_password = hash_password(body.new_password)
+    token.used_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return PasswordResetConfirmResponse(ok=True)
 
 
 # ---------------------------------------------------------------------------

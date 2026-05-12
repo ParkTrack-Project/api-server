@@ -19,9 +19,28 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token:        str = Field(min_length=16)
+    new_password: str = Field(min_length=6, max_length=72)
+
+
 # ---------------------------------------------------------------------------
 # Ответы
 # ---------------------------------------------------------------------------
+
+class PasswordResetRequestResponse(BaseModel):
+    ok: bool = True
+    reset_token: str | None = None
+
+
+class PasswordResetConfirmResponse(BaseModel):
+    ok: bool = True
+
+
 
 class AuthUserInfo(BaseModel):
     user_id:      int

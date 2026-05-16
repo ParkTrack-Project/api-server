@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+from .validators import validate_optional_phone
 
 
 # ---------------------------------------------------------------------------
@@ -26,12 +28,22 @@ class CreatePartnerRequest(BaseModel):
     contact_email: EmailStr
     contact_phone: str   = Field(min_length=5, max_length=255)
 
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return validate_optional_phone(value)
+
 
 class UpdatePartnerRequest(BaseModel):
     legal_name:    str       | None = Field(None, min_length=2, max_length=255)
     contact_email: EmailStr  | None = None
     contact_phone: str       | None = Field(None, min_length=5, max_length=255)
     is_active:     bool      | None = None
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return validate_optional_phone(value)
 
 
 class PartnerListResponse(BaseModel):

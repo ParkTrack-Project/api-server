@@ -78,6 +78,29 @@ def _assert_owner_or_admin(route: Route, current_user: User) -> None:
         )
 
 
+_ANON_EMAIL = "anonymous@parktrack.local"
+
+
+def _anon_user(db: Session) -> User:
+    """2026-05-16: backend открыт без авторизации (по запросу). Route.user_id —
+    NOT NULL FK на users, null нельзя без миграции. Анонимные маршруты вешаем
+    на системного пользователя (get-or-create по фикс. email). hashed_password
+    невалиден → залогиниться этим юзером нельзя."""
+    u = db.query(User).filter(User.email == _ANON_EMAIL).one_or_none()
+    if u is None:
+        u = User(
+            email=_ANON_EMAIL,
+            hashed_password="!",
+            full_name="Anonymous",
+            global_role=GlobalRole.user,
+            is_active=True,
+        )
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    return u
+
+
 def _build_candidate_from_zone(
     zone: ParkingZone,
     origin: GeoPoint,
@@ -116,9 +139,10 @@ def _build_candidate_from_zone(
 @router.post("/search", response_model=SearchRoutingResponse)
 def search_routing(
     body: SearchRoutingRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
+    # 2026-05-16: открыто без авторизации (по запросу). /search ничего не
+    # сохраняет — current_user не нужен.
     candidates = find_candidates(
         db=db,
         origin=body.origin,
@@ -153,9 +177,10 @@ def search_routing(
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
 def create_route(
     body: CreateRouteRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
+    # 2026-05-16: открыто без авторизации (по запросу). Владелец — системный
+    # anon-пользователь (Route.user_id NOT NULL, см. _anon_user).
     candidates = find_candidates(
         db=db,
         origin=body.origin,
@@ -198,7 +223,7 @@ def create_route(
     deeplink = build_deeplink(body.provider, z_lat, z_lon)
 
     route = Route(
-        user_id=current_user.user_id,
+        user_id=_anon_user(db).user_id,
         mode=RouteMode(body.mode),
         provider=body.provider,
         origin_latitude=body.origin.latitude,
@@ -275,11 +300,11 @@ def list_routes(
 @router.get("/{route_id}", response_model=RouteResponse)
 def get_route(
     route_id: int,
-    current_user: Annotated[User, require("routing.view")],
     db: Annotated[Session, Depends(get_db)],
 ):
+    # 2026-05-16: открыто без авторизации (по запросу). Маршрут читается по id
+    # без проверки владельца (RoutePreviewLayer тянет ?route=N после reload).
     route = _get_route_or_404(db, route_id)
-    _assert_owner_or_admin(route, current_user)
     return _serialize_route(route)
 
 

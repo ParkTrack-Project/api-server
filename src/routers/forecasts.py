@@ -92,7 +92,7 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
                  | list[ForecastMapItem],
 )
 def list_forecasts(
-    current_user:      Annotated[User, require("forecasts.view")],
+    # 2026-05-16: открыто без авторизации (по запросу) — режим «Будущее» на карте.
     db:                Annotated[Session, Depends(get_db)],
     zone_id:           int    | None = None,
     camera_id:         int    | None = None,

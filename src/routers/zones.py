@@ -192,9 +192,9 @@ def create_zone(
 @router.get("/{zone_id}", response_model=ZoneResponse)
 def get_zone(
     zone_id: int,
-    current_user: Annotated[User, require("zones.view")],
     db: Annotated[Session, Depends(get_db)],
 ):
+    # 2026-05-16: открыто без авторизации (по запросу) — как и GET /zones?view=map.
     return _serialize(_get_zone_or_404(db, zone_id), db)
 
 

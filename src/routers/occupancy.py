@@ -94,7 +94,7 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
                  | list[OccupancyMapItem],
 )
 def list_occupancy(
-    current_user: Annotated[User, require("occupancy.view")],
+    # 2026-05-16: открыто без авторизации (по запросу) — режим «Прошлое» на карте.
     db:           Annotated[Session, Depends(get_db)],
     zone_id:      int    | None = None,
     camera_id:    int    | None = None,

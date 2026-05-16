@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+from .validators import validate_optional_phone
 
 
 class UserResponse(BaseModel):
@@ -22,6 +24,11 @@ class UpdateUserRequest(BaseModel):
     phone:     str | None = Field(None, max_length=50)
     email:     EmailStr   | None = None
 
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return validate_optional_phone(value)
+
 
 class UpdatePasswordRequest(BaseModel):
     old_password: str
@@ -35,6 +42,11 @@ class AdminUpdateUserRequest(BaseModel):
     email:       EmailStr   | None = None
     global_role: str        | None = None
     is_active:   bool       | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return validate_optional_phone(value)
 
 
 class UserListResponse(BaseModel):
@@ -62,4 +74,9 @@ class AdminCreateUserRequest(BaseModel):
     full_name:  str | None = Field(None, max_length=255)
     phone:      str | None = Field(None, max_length=50)
     global_role: str = "user"
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        return validate_optional_phone(value)
     

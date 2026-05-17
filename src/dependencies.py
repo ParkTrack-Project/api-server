@@ -1,6 +1,7 @@
 """
 Зависимости FastAPI:
-  - get_current_user   — декодирует JWT, возвращает User из БД
+  - get_current_user   — принимает API_TOKEN из заголовка api_token
+                         или декодирует JWT, возвращает User из БД
   - require            — фабрика зависимостей для проверки permissions
   - BASE_USER_PERMISSIONS — хардкод прав для роли 'user'
 """
@@ -8,11 +9,12 @@
 from __future__ import annotations
 
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -27,6 +29,9 @@ from .db_models import GlobalRole, PartnerMembership, User, UserPermission
 JWT_SECRET:    str = os.environ.get("JWT_SECRET", "CHANGE_ME_IN_PRODUCTION")
 JWT_ALGORITHM: str = "HS256"
 JWT_EXPIRE_SECONDS: int = int(os.environ.get("JWT_EXPIRE_SECONDS", 86400))  # 24 ч
+API_TOKEN_HEADER_NAME = "api_token"
+API_TOKEN_USER_EMAIL = "api-token@parktrack.local"
+_API_TOKEN_AUTH_ATTR = "_authenticated_via_api_token"
 
 # ---------------------------------------------------------------------------
 # Хэширование паролей
@@ -176,6 +181,55 @@ PARTNER_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     }),
 }
 
+API_TOKEN_PERMISSIONS: frozenset[str] = frozenset({
+    *BASE_ADMIN_PERMISSIONS,
+    *(permission for permissions in PARTNER_ROLE_PERMISSIONS.values() for permission in permissions),
+    "forecasts.write",
+    "forecasts.delete",
+    "occupancy.write",
+    "occupancy.delete",
+})
+
+
+def _configured_api_token() -> str | None:
+    token = os.getenv("API_TOKEN")
+    return token if token else None
+
+
+def _api_token_matches(candidate: str | None) -> bool:
+    token = _configured_api_token()
+    return bool(token and candidate and secrets.compare_digest(candidate, token))
+
+
+def _mark_api_token_authenticated(user: User) -> User:
+    setattr(user, _API_TOKEN_AUTH_ATTR, True)
+    return user
+
+
+def is_api_token_authenticated(user: User) -> bool:
+    return getattr(user, _API_TOKEN_AUTH_ATTR, False) is True
+
+
+def _get_api_token_user(db: Session) -> User:
+    user = db.query(User).filter(User.email == API_TOKEN_USER_EMAIL).one_or_none()
+    if user is None:
+        user = User(
+            email=API_TOKEN_USER_EMAIL,
+            hashed_password=hash_password(secrets.token_urlsafe(48)),
+            full_name="API Token",
+            global_role=GlobalRole.admin,
+            is_active=False,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    elif user.is_active or user.global_role != GlobalRole.admin:
+        user.is_active = False
+        user.global_role = GlobalRole.admin
+        db.commit()
+        db.refresh(user)
+    return _mark_api_token_authenticated(user)
+
 
 def get_membership_permissions(membership: PartnerMembership) -> set[str]:
     return set(PARTNER_ROLE_PERMISSIONS.get(membership.user_role, frozenset()))
@@ -186,6 +240,9 @@ def get_effective_permissions(user: User) -> set[str]:
     Возвращает эффективный набор прав пользователя:
     базовые (по роли) + дополнительные из user_permissions + права партнёрских ролей.
     """
+    if is_api_token_authenticated(user):
+        return set(API_TOKEN_PERMISSIONS)
+
     base = BASE_ADMIN_PERMISSIONS if user.global_role == GlobalRole.admin else BASE_USER_PERMISSIONS
     extra = {p.permission for p in user.permissions}
     partner_permissions: set[str] = set()
@@ -203,11 +260,15 @@ def get_effective_permissions(user: User) -> set[str]:
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
-    db: Annotated[Session, Depends(get_db)],
+def resolve_current_user(
+    credentials: HTTPAuthorizationCredentials | None,
+    db: Session,
+    api_token: str | None = None,
 ) -> User:
-    """Обязательная авторизация. Бросает 401, если токен отсутствует или невалиден."""
+    """Обязательная авторизация по API_TOKEN или JWT."""
+    if _api_token_matches(api_token):
+        return _get_api_token_user(db)
+
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -221,6 +282,15 @@ def get_current_user(
             detail={"error_description": "User not found or inactive"},
         )
     return user
+
+
+def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+    db: Annotated[Session, Depends(get_db)],
+    api_token: Annotated[str | None, Header(alias=API_TOKEN_HEADER_NAME)] = None,
+) -> User:
+    """Обязательная авторизация. Бросает 401, если токен отсутствует или невалиден."""
+    return resolve_current_user(credentials=credentials, db=db, api_token=api_token)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
@@ -239,6 +309,9 @@ def require(*permissions: str):
     def _dependency(
         current_user: CurrentUser,
     ) -> User:
+        if is_api_token_authenticated(current_user):
+            return current_user
+
         effective = get_effective_permissions(current_user)
         missing = [p for p in permissions if p not in effective]
         if missing:

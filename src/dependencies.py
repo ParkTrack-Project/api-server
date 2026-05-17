@@ -1,7 +1,6 @@
 """
 Зависимости FastAPI:
-  - get_current_user   — принимает API_TOKEN из заголовка api_token
-                         или декодирует JWT, возвращает User из БД
+  - get_current_user   — принимает API_TOKEN или JWT через Authorization: Bearer
   - require            — фабрика зависимостей для проверки permissions
   - BASE_USER_PERMISSIONS — хардкод прав для роли 'user'
 """
@@ -14,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -29,7 +28,6 @@ from .db_models import GlobalRole, PartnerMembership, User, UserPermission
 JWT_SECRET:    str = os.environ.get("JWT_SECRET", "CHANGE_ME_IN_PRODUCTION")
 JWT_ALGORITHM: str = "HS256"
 JWT_EXPIRE_SECONDS: int = int(os.environ.get("JWT_EXPIRE_SECONDS", 86400))  # 24 ч
-API_TOKEN_HEADER_NAME = "api_token"
 API_TOKEN_USER_EMAIL = "api-token@parktrack.local"
 _API_TOKEN_AUTH_ATTR = "_authenticated_via_api_token"
 
@@ -263,18 +261,19 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 def resolve_current_user(
     credentials: HTTPAuthorizationCredentials | None,
     db: Session,
-    api_token: str | None = None,
 ) -> User:
-    """Обязательная авторизация по API_TOKEN или JWT."""
-    if _api_token_matches(api_token):
-        return _get_api_token_user(db)
-
+    """Обязательная авторизация по Bearer API_TOKEN или Bearer JWT."""
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error_description": "Missing or invalid access token"},
         )
-    user_id = decode_access_token(credentials.credentials)
+
+    token = credentials.credentials
+    if _api_token_matches(token):
+        return _get_api_token_user(db)
+
+    user_id = decode_access_token(token)
     user = db.query(User).filter(User.user_id == user_id).one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(
@@ -287,10 +286,9 @@ def resolve_current_user(
 def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
     db: Annotated[Session, Depends(get_db)],
-    api_token: Annotated[str | None, Header(alias=API_TOKEN_HEADER_NAME)] = None,
 ) -> User:
     """Обязательная авторизация. Бросает 401, если токен отсутствует или невалиден."""
-    return resolve_current_user(credentials=credentials, db=db, api_token=api_token)
+    return resolve_current_user(credentials=credentials, db=db)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

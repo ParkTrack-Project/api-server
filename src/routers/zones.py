@@ -3,14 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..db_models import Camera, ParkingZone, Partner, User
-from ..dependencies import API_TOKEN_HEADER_NAME, get_effective_permissions, require, resolve_current_user
+from ..dependencies import get_effective_permissions, require, resolve_current_user
 from ..schemas.zones import (
     CreateZoneRequest,
     UpdateZoneRequest,
@@ -102,10 +102,9 @@ def list_zones(
     top:            int          = 100,
     offset:         int          = 0,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(HTTPBearer(auto_error=False))] = None,
-    api_token: Annotated[str | None, Header(alias=API_TOKEN_HEADER_NAME)] = None,
 ):
     if view != "map":
-        current_user = resolve_current_user(credentials=credentials, db=db, api_token=api_token)
+        current_user = resolve_current_user(credentials=credentials, db=db)
         if "zones.view" not in get_effective_permissions(current_user):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,

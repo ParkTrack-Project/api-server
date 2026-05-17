@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from io import BytesIO
+import os
+from pathlib import Path
 from typing import Annotated
 
-import cv2
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
-from PIL import Image
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -317,22 +316,18 @@ def get_snapshot(
     camera = _get_camera_or_404(db, camera_id)
     _ensure_camera_visible(camera, current_user)
 
-    # annotated-снапшот здесь не реализован (нет CV pipeline) — fallback к raw
-    cap = cv2.VideoCapture(camera.source)
-    try:
-        if not cap.isOpened():
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail={"error_description": "Failed to open video stream"})
-        ret, frame = cap.read()
-        if not ret:
-            raise HTTPException(status.HTTP_404_NOT_FOUND,
-                                detail={"error_description": "Camera snapshot not available"})
+    images_directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
+    if not images_directory:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_description": "Camera images directory is not configured"},
+        )
 
-        _, buffer = cv2.imencode(".jpg", frame)
-        img = Image.open(BytesIO(buffer.tobytes()))
-        out = BytesIO()
-        img.save(out, format="JPEG")
-        out.seek(0)
-        return StreamingResponse(out, media_type="image/jpeg")
-    finally:
-        cap.release()
+    snapshot_path = Path(images_directory) / f"{camera_id}.jpg"
+    if not snapshot_path.is_file():
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera snapshot not available"},
+        )
+
+    return FileResponse(snapshot_path, media_type="image/jpeg")

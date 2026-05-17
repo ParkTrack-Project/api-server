@@ -3,14 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..db_models import Camera, ParkingZone, Partner, User
-from ..dependencies import CurrentUser, get_current_user, require
+from ..dependencies import API_TOKEN_HEADER_NAME, get_effective_permissions, require, resolve_current_user
 from ..schemas.zones import (
     CreateZoneRequest,
     UpdateZoneRequest,
@@ -102,21 +102,10 @@ def list_zones(
     top:            int          = 100,
     offset:         int          = 0,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(HTTPBearer(auto_error=False))] = None,
+    api_token: Annotated[str | None, Header(alias=API_TOKEN_HEADER_NAME)] = None,
 ):
     if view != "map":
-        if credentials is None:
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                detail={"error_description": "Missing or invalid access token"},
-            )
-        from ..dependencies import decode_access_token, get_effective_permissions
-        user_id = decode_access_token(credentials.credentials)
-        current_user = db.query(User).filter(User.user_id == user_id).one_or_none()
-        if current_user is None or not current_user.is_active:
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                detail={"error_description": "User not found or inactive"},
-            )
+        current_user = resolve_current_user(credentials=credentials, db=db, api_token=api_token)
         if "zones.view" not in get_effective_permissions(current_user):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,

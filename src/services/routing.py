@@ -197,7 +197,15 @@ def find_candidates(
         if destination:
             dist_dest = _haversine(z_lat, z_lon, destination.latitude, destination.longitude)
             dur_dest  = _duration_on_foot(dist_dest)
-            if max_distance_to_destination_meters and dist_dest > max_distance_to_destination_meters:
+            # 2026-05-17: если пользователь ЯВНО выбрал зону (selected_zone_id,
+            # путь /routing/new) — не отсеиваем её по расстоянию до адреса.
+            # Выбор уже сделан; destination нужен лишь для ETA пешком. Иначе
+            # центроид длинной parallel-зоны / погрешность геокодера давали 422.
+            if (
+                selected_zone_id is None
+                and max_distance_to_destination_meters
+                and dist_dest > max_distance_to_destination_meters
+            ):
                 continue
 
         # --- прогноз к моменту прибытия ---

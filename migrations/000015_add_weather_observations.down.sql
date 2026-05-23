@@ -1,1 +1,1 @@
-DROP TABLE IF EXISTS weather_obsertvations;
+DROP TABLE IF EXISTS weather_observations;

@@ -89,6 +89,7 @@ BASE_USER_PERMISSIONS: frozenset[str] = frozenset({
     "zones.view",
     "occupancy.view",
     "forecasts.view",
+    "weather.view",
     "routing.create",
     "feedback.create",
     "sources.view",
@@ -186,6 +187,7 @@ API_TOKEN_PERMISSIONS: frozenset[str] = frozenset({
     "forecasts.delete",
     "occupancy.write",
     "occupancy.delete",
+    "weather.write",
 })
 
 

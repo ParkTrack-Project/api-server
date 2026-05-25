@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from io import BytesIO
 import os
+import cv2
+import numpy as np
+import requests
+from PIL import Image
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, StreamingResponse
-from PIL import Image
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -307,6 +310,47 @@ def delete_camera(
 # GET /cameras/{camera_id}/snapshot
 # ---------------------------------------------------------------------------
 
+def read_frame_from_video(source: str):
+    cap = cv2.VideoCapture(source)
+
+    try:
+        if not cap.isOpened():
+            return None
+
+        ret, frame = cap.read()
+
+        if not ret or frame is None:
+            return None
+
+        return frame
+
+    finally:
+        cap.release()
+
+
+def read_frame_from_image_url(source: str):
+    try:
+        response = requests.get(source, timeout=5)
+    except requests.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    content_type = response.headers.get("content-type", "")
+
+    if not content_type.startswith("image/"):
+        return None
+
+    image_bytes = np.frombuffer(response.content, dtype=np.uint8)
+    frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return None
+
+    return frame
+
+
 @router.get("/{camera_id}/snapshot")
 def get_snapshot(
     camera_id: int,
@@ -335,21 +379,26 @@ def get_snapshot(
 
         return FileResponse(snapshot_path, media_type="image/jpeg")
 
-    cap = cv2.VideoCapture(camera.source)
-    try:
-        if not cap.isOpened():
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail={"error_description": "Failed to open video stream"})
-        ret, frame = cap.read()
-        if not ret:
-            raise HTTPException(status.HTTP_404_NOT_FOUND,
-                                detail={"error_description": "Camera snapshot not available"})
+    frame = read_frame_from_video(camera.source)
 
-        _, buffer = cv2.imencode(".jpg", frame)
-        img = Image.open(BytesIO(buffer.tobytes()))
-        out = BytesIO()
-        img.save(out, format="JPEG")
-        out.seek(0)
-        return StreamingResponse(out, media_type="image/jpeg")
-    finally:
-        cap.release()
+    if frame is None:
+        frame = read_frame_from_image_url(camera.source)
+
+    if frame is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera snapshot not available"},
+        )
+
+    success, buffer = cv2.imencode(".jpg", frame)
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error_description": "Failed to encode snapshot"},
+        )
+
+    out = BytesIO(buffer.tobytes())
+    out.seek(0)
+
+    return StreamingResponse(out, media_type="image/jpeg")

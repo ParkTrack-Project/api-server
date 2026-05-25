@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-import cv2
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image

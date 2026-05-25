@@ -4,6 +4,7 @@ import os
 import cv2
 import numpy as np
 import requests
+from PIL import Image
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated

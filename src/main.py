@@ -23,6 +23,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://swagger.parktrack.live",
+        "https://swagger.dev.parktrack.live",
         "https://labeler.parktrack.live",
         "https://admin.parktrack.live",
         "https://parktrack.live",

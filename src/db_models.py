@@ -7,7 +7,7 @@ import enum
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Double, Enum,
+    BigInteger, Boolean, CheckConstraint, Column, DateTime, Double, Enum,
     ForeignKey, Integer, String, Text, UniqueConstraint,
     func,
 )
@@ -220,6 +220,7 @@ class Camera(Base):
     partner      = relationship("Partner", back_populates="cameras")
     created_by   = relationship("User",    foreign_keys=[created_by_user_id])
     zones        = relationship("ParkingZone", back_populates="camera", cascade="all, delete-orphan")
+    weather_observations = relationship("WeatherObservation", back_populates="camera", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Camera id={self.camera_id} title={self.title!r}>"
@@ -359,6 +360,28 @@ class Forecast(Base):
 
     def __repr__(self) -> str:
         return f"<Forecast id={self.forecast_id} zone_id={self.zone_id} for={self.predicted_for}>"
+
+
+# ---------------------------------------------------------------------------
+# Weather Observations
+# ---------------------------------------------------------------------------
+
+class WeatherObservation(Base):
+    __tablename__ = "weather_observations"
+
+    camera_id     = Column(BigInteger, ForeignKey("cameras.camera_id"), primary_key=True, nullable=False)
+    observed_at   = Column(DateTime(timezone=True), primary_key=True, nullable=False)
+    temperature   = Column(Double, nullable=False)
+    precipitation = Column(Double, nullable=False)
+
+    camera = relationship("Camera", back_populates="weather_observations", foreign_keys=[camera_id])
+
+    __table_args__ = (
+        CheckConstraint("precipitation >= 0", name="ck_weather_observations_precipitation_non_negative"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WeatherObservation camera_id={self.camera_id} observed_at={self.observed_at}>"
 
 # ---------------------------------------------------------------------------
 # Routes

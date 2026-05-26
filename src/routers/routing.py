@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -19,7 +19,7 @@ from ..schemas.routing import (
     SearchRoutingResponse,
     UpdateRouteRequest,
 )
-from ..services.routing import build_deeplink, find_candidates
+from ..services.routing import RoutingProviderError, build_deeplink, search_candidates
 
 router = APIRouter(prefix="/routing", tags=["Routing"])
 
@@ -78,27 +78,25 @@ def _assert_owner_or_admin(route: Route, current_user: User) -> None:
         )
 
 
-_ANON_EMAIL = "anonymous@parktrack.local"
+def _provider_unavailable(exc: RoutingProviderError) -> HTTPException:
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"error_description": str(exc)},
+    )
 
 
-def _anon_user(db: Session) -> User:
-    """2026-05-16: backend открыт без авторизации (по запросу). Route.user_id —
-    NOT NULL FK на users, null нельзя без миграции. Анонимные маршруты вешаем
-    на системного пользователя (get-or-create по фикс. email). hashed_password
-    невалиден → залогиниться этим юзером нельзя."""
-    u = db.query(User).filter(User.email == _ANON_EMAIL).one_or_none()
-    if u is None:
-        u = User(
-            email=_ANON_EMAIL,
-            hashed_password="!",
-            full_name="Anonymous",
-            global_role=GlobalRole.user,
-            is_active=True,
-        )
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-    return u
+def _zone_centroid(zone: ParkingZone | None) -> tuple[float, float]:
+    if zone is None:
+        return 0.0, 0.0
+    try:
+        coords = list(zone.geometry["coordinates"][0])
+        if len(coords) > 1 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        z_lat = sum(float(c[1]) for c in coords) / len(coords)
+        z_lon = sum(float(c[0]) for c in coords) / len(coords)
+        return z_lat, z_lon
+    except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError):
+        return float(zone.geometry.get("lat", 0.0)), float(zone.geometry.get("lon", 0.0))
 
 
 def _build_candidate_from_zone(
@@ -107,13 +105,15 @@ def _build_candidate_from_zone(
     destination: GeoPoint | None,
     db: Session,
     use_forecast: bool,
+    provider: str,
+    mode: str,
 ) -> RouteCandidate:
     """Строим одного кандидата для конкретной зоны (используется при PUT с новым zone_id)."""
-    candidates = find_candidates(
+    result = search_candidates(
         db=db,
         origin=origin,
         destination=destination,
-        mode="find_parking",
+        mode=mode,
         max_pay=None,
         min_free_count=None,
         min_confidence=None,
@@ -122,14 +122,15 @@ def _build_candidate_from_zone(
         include_accessible=None,
         use_forecast=use_forecast,
         limit=1,
+        provider=provider,
         selected_zone_id=zone.parking_zone_id,
     )
-    if not candidates:
+    if not result.candidates:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"error_description": "Cannot build route to the selected zone"},
         )
-    return candidates[0]
+    return result.candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -139,25 +140,29 @@ def _build_candidate_from_zone(
 @router.post("/search", response_model=SearchRoutingResponse)
 def search_routing(
     body: SearchRoutingRequest,
+    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    # 2026-05-16: открыто без авторизации (по запросу). /search ничего не
-    # сохраняет — current_user не нужен.
-    candidates = find_candidates(
-        db=db,
-        origin=body.origin,
-        destination=body.destination,
-        mode=body.mode,
-        max_pay=body.max_pay,
-        min_free_count=body.min_free_count,
-        min_confidence=body.min_confidence,
-        max_distance_to_destination_meters=body.max_distance_to_destination_meters,
-        max_duration_from_origin_seconds=body.max_duration_from_origin_seconds,
-        include_accessible=body.include_accessible,
-        use_forecast=body.use_forecast,
-        limit=body.limit,
-    )
+    try:
+        result = search_candidates(
+            db=db,
+            origin=body.origin,
+            destination=body.destination,
+            mode=body.mode,
+            max_pay=body.max_pay,
+            min_free_count=body.min_free_count,
+            min_confidence=body.min_confidence,
+            max_distance_to_destination_meters=body.max_distance_to_destination_meters,
+            max_duration_from_origin_seconds=body.max_duration_from_origin_seconds,
+            include_accessible=body.include_accessible,
+            use_forecast=body.use_forecast,
+            limit=body.limit,
+            provider=body.provider,
+        )
+    except RoutingProviderError as exc:
+        raise _provider_unavailable(exc) from exc
 
+    candidates = result.candidates
     selected_zone_id = candidates[0].zone_id if candidates else None
 
     return SearchRoutingResponse(
@@ -165,7 +170,7 @@ def search_routing(
         provider=body.provider,
         generated_at=datetime.now(timezone.utc),
         selected_zone_id=selected_zone_id,
-        total_candidates=len(candidates),
+        total_candidates=result.total_candidates,
         candidates=candidates,
     )
 
@@ -177,26 +182,42 @@ def search_routing(
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
 def create_route(
     body: CreateRouteRequest,
+    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    # 2026-05-16: открыто без авторизации (по запросу). Владелец — системный
-    # anon-пользователь (Route.user_id NOT NULL, см. _anon_user).
-    candidates = find_candidates(
-        db=db,
-        origin=body.origin,
-        destination=body.destination,
-        mode=body.mode,
-        max_pay=body.max_pay,
-        min_free_count=body.min_free_count,
-        min_confidence=body.min_confidence,
-        max_distance_to_destination_meters=body.max_distance_to_destination_meters,
-        max_duration_from_origin_seconds=body.max_duration_from_origin_seconds,
-        include_accessible=body.include_accessible,
-        use_forecast=body.use_forecast,
-        limit=body.limit,
-        selected_zone_id=body.selected_zone_id,
-    )
+    if body.selected_zone_id is not None:
+        zone_exists = (
+            db.query(ParkingZone.parking_zone_id)
+            .filter(ParkingZone.parking_zone_id == body.selected_zone_id)
+            .one_or_none()
+        )
+        if zone_exists is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                detail={"error_description": f"Zone {body.selected_zone_id} not found"},
+            )
 
+    try:
+        result = search_candidates(
+            db=db,
+            origin=body.origin,
+            destination=body.destination,
+            mode=body.mode,
+            max_pay=body.max_pay,
+            min_free_count=body.min_free_count,
+            min_confidence=body.min_confidence,
+            max_distance_to_destination_meters=body.max_distance_to_destination_meters,
+            max_duration_from_origin_seconds=body.max_duration_from_origin_seconds,
+            include_accessible=body.include_accessible,
+            use_forecast=body.use_forecast,
+            limit=body.limit,
+            provider=body.provider,
+            selected_zone_id=body.selected_zone_id,
+        )
+    except RoutingProviderError as exc:
+        raise _provider_unavailable(exc) from exc
+
+    candidates = result.candidates
     if not candidates:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -211,19 +232,11 @@ def create_route(
     zone = db.query(ParkingZone).filter(
         ParkingZone.parking_zone_id == best.zone_id
     ).one_or_none()
-    z_lat = zone.geometry["coordinates"][0][0][1] if zone else best.zone_id
-    z_lon = zone.geometry["coordinates"][0][0][0] if zone else best.zone_id
-    try:
-        coords = zone.geometry["coordinates"][0]
-        z_lat = sum(c[1] for c in coords) / len(coords)
-        z_lon = sum(c[0] for c in coords) / len(coords)
-    except Exception:
-        z_lat, z_lon = 0.0, 0.0
-
+    z_lat, z_lon = _zone_centroid(zone)
     deeplink = build_deeplink(body.provider, z_lat, z_lon)
 
     route = Route(
-        user_id=_anon_user(db).user_id,
+        user_id=current_user.user_id,
         mode=RouteMode(body.mode),
         provider=body.provider,
         origin_latitude=body.origin.latitude,
@@ -254,10 +267,10 @@ def create_route(
 def list_routes(
     current_user: Annotated[User, require("routing.view")],
     db: Annotated[Session, Depends(get_db)],
-    route_status: str | None = None,
-    mode:         str | None = None,
-    top:          int = 20,
-    offset:       int = 0,
+    route_status: Annotated[str | None, Query(alias="status")] = None,
+    mode: Annotated[str | None, Query()] = None,
+    top: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     query = db.query(Route)
 
@@ -300,11 +313,11 @@ def list_routes(
 @router.get("/{route_id}", response_model=RouteResponse)
 def get_route(
     route_id: int,
+    current_user: Annotated[User, require("routing.view")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    # 2026-05-16: открыто без авторизации (по запросу). Маршрут читается по id
-    # без проверки владельца (RoutePreviewLayer тянет ?route=N после reload).
     route = _get_route_or_404(db, route_id)
+    _assert_owner_or_admin(route, current_user)
     return _serialize_route(route)
 
 
@@ -350,22 +363,20 @@ def update_route(
                 longitude=route.destination_longitude,
             )
 
-        candidate = _build_candidate_from_zone(
-            zone=zone,
-            origin=origin,
-            destination=destination,
-            db=db,
-            use_forecast=True,
-        )
-
-        # Пересчитываем deeplink
         try:
-            coords = zone.geometry["coordinates"][0]
-            z_lat = sum(c[1] for c in coords) / len(coords)
-            z_lon = sum(c[0] for c in coords) / len(coords)
-        except Exception:
-            z_lat, z_lon = 0.0, 0.0
+            candidate = _build_candidate_from_zone(
+                zone=zone,
+                origin=origin,
+                destination=destination,
+                db=db,
+                use_forecast=True,
+                provider=body.provider or route.provider,
+                mode=route.mode.value,
+            )
+        except RoutingProviderError as exc:
+            raise _provider_unavailable(exc) from exc
 
+        z_lat, z_lon = _zone_centroid(zone)
         provider = body.provider or route.provider
         route.selected_zone_id = body.selected_zone_id
         route.selected_candidate = candidate.model_dump(mode="json")
@@ -373,6 +384,12 @@ def update_route(
         route.arrival_time = candidate.predicted_for_arrival
         route.deeplink_url = build_deeplink(provider, z_lat, z_lon)
         route.polyline = None  # пересчёт polyline — задача внешнего провайдера
+    elif body.provider is not None and route.selected_zone_id is not None:
+        zone = db.query(ParkingZone).filter(
+            ParkingZone.parking_zone_id == route.selected_zone_id
+        ).one_or_none()
+        z_lat, z_lon = _zone_centroid(zone)
+        route.deeplink_url = build_deeplink(route.provider, z_lat, z_lon)
 
     route.updated_at = datetime.now(timezone.utc)
     db.commit()

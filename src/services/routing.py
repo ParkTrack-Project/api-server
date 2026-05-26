@@ -32,7 +32,7 @@ _DRIVING_SPEED_MPS = 8.33       # м/с (~30 км/ч в городе)
 _PROVIDER_INTERNAL = "internal"
 _PROVIDER_YANDEX = "yandex"
 _SUPPORTED_PROVIDERS = {_PROVIDER_INTERNAL, _PROVIDER_YANDEX}
-_YANDEX_DISTANCE_MATRIX_URL = "https://api.routing.yandex.net/v2/distancematrix"
+_YANDEX_DISTANCE_MATRIX_URL = "http://nawinds-ha.duckdns.org:5002"#"https://api.routing.yandex.net/v2/distancematrix"
 _YANDEX_MATRIX_MAX_ITEMS = 100
 _T = TypeVar("_T")
 

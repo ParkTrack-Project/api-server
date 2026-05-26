@@ -140,7 +140,6 @@ def _build_candidate_from_zone(
 @router.post("/search", response_model=SearchRoutingResponse)
 def search_routing(
     body: SearchRoutingRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
     try:

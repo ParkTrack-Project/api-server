@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+RoutingProvider = Literal["yandex", "internal", "external"]
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные типы
@@ -89,7 +91,7 @@ class RoutingRequestBase(BaseModel):
     include_accessible:                 bool  | None = None
     limit:                              int          = Field(10, ge=1, le=50)
     use_forecast:                       bool         = False
-    provider:                           str          = "internal"
+    provider:                           RoutingProvider = "yandex"
 
     @model_validator(mode="after")
     def destination_required_for_route_mode(self) -> "RoutingRequestBase":
@@ -126,4 +128,4 @@ class SearchRoutingResponse(BaseModel):
 class UpdateRouteRequest(BaseModel):
     status:          Literal["active", "completed", "cancelled", "replaced"] | None = None
     selected_zone_id: int  | None = None
-    provider:        str   | None = None
+    provider:        RoutingProvider | None = None

@@ -181,7 +181,6 @@ def search_routing(
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
 def create_route(
     body: CreateRouteRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
     if body.selected_zone_id is not None:

@@ -230,9 +230,7 @@ def create_observation(
     capacity = body.capacity if body.capacity is not None else zone.capacity
 
     if body.occupied > capacity:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail={"error_description": "Validation error: occupied must be between 0 and capacity"})
-
+        body.occupied = capacity
     # Уникальность (source_type, source_ref) — только если source_ref задан
     if body.source_ref:
         conflict = db.query(OccupancyObservation).filter_by(

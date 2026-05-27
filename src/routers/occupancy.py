@@ -100,9 +100,9 @@ def list_occupancy(
     camera_id:    int    | None = None,
     partner_id:   int    | None = None,
     source_type:  str    | None = None,
-    from_:        str    | None = Query(None, alias="from"),
-    to:           str    | None = None,
-    at:           str    | None = None,
+    from_: datetime      | None = Query(None, alias="from"),
+    to: datetime         | None = None,
+    at: datetime         | None = None,
     latest_only:  bool          = False,
     bbox:         str    | None = None,
     view:         str           = "observations",
@@ -122,31 +122,65 @@ def list_occupancy(
     if to:
         query = query.filter(OccupancyObservation.observed_at <= to)
 
-    if view == "map" or latest_only:
-        if at:
-            latest_sq = (
-                db.query(
-                    OccupancyObservation.zone_id.label("zone_id"),
-                    func.max(OccupancyObservation.observed_at).label("max_obs"),
-                )
-                .filter(OccupancyObservation.observed_at <= at)
-                .group_by(OccupancyObservation.zone_id)
-                .subquery()
+    # Если указан at, независимо от view возвращаем по одному наблюдению
+    # на каждую зону: последнее observed_at <= at.
+    #
+    # Важно: row_number нужен, потому что у одной зоны может быть несколько
+    # наблюдений с одинаковым observed_at. Тогда берём более позднее ingested_at,
+    # а если и оно совпало — большее observation_id.
+    if at is not None:
+        ranked_sq = (
+            query
+            .filter(OccupancyObservation.observed_at <= at)
+            .with_entities(
+                OccupancyObservation.observation_id.label("observation_id"),
+                func.row_number().over(
+                    partition_by=OccupancyObservation.zone_id,
+                    order_by=(
+                        OccupancyObservation.observed_at.desc(),
+                        OccupancyObservation.ingested_at.desc(),
+                        OccupancyObservation.observation_id.desc(),
+                    ),
+                ).label("rn"),
             )
-        else:
-            latest_sq = (
-                db.query(
-                    OccupancyObservation.zone_id.label("zone_id"),
-                    func.max(OccupancyObservation.observed_at).label("max_obs"),
-                )
-                .group_by(OccupancyObservation.zone_id)
-                .subquery()
-            )
+            .subquery()
+        )
 
-        query = query.join(
-            latest_sq,
-            (OccupancyObservation.zone_id == latest_sq.c.zone_id)
-            & (OccupancyObservation.observed_at == latest_sq.c.max_obs),
+        query = (
+            db.query(OccupancyObservation)
+            .join(
+                ranked_sq,
+                OccupancyObservation.observation_id == ranked_sq.c.observation_id,
+            )
+            .filter(ranked_sq.c.rn == 1)
+        )
+
+    # Если at не указан, но нужен последний срез для карты или latest_only=true,
+    # оставляем старую идею: по одной последней записи на каждую зону.
+    elif view == "map" or latest_only:
+        ranked_sq = (
+            query
+            .with_entities(
+                OccupancyObservation.observation_id.label("observation_id"),
+                func.row_number().over(
+                    partition_by=OccupancyObservation.zone_id,
+                    order_by=(
+                        OccupancyObservation.observed_at.desc(),
+                        OccupancyObservation.ingested_at.desc(),
+                        OccupancyObservation.observation_id.desc(),
+                    ),
+                ).label("rn"),
+            )
+            .subquery()
+        )
+
+        query = (
+            db.query(OccupancyObservation)
+            .join(
+                ranked_sq,
+                OccupancyObservation.observation_id == ranked_sq.c.observation_id,
+            )
+            .filter(ranked_sq.c.rn == 1)
         )
         
     if bbox and view == "map":

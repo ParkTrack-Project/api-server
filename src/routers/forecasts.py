@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -98,11 +99,11 @@ def list_forecasts(
     camera_id:         int    | None = None,
     partner_id:        int    | None = None,
     model_type:        str    | None = None,
-    generated_from:    str    | None = None,
-    generated_to:      str    | None = None,
-    from_:             str    | None = Query(None, alias="from"),
-    to:                str    | None = None,
-    at:                str    | None = None,
+    generated_from:    datetime | None = None,
+    generated_to:      datetime | None = None,
+    from_:             datetime | None = Query(None, alias="from"),
+    to:                datetime | None = None,
+    at:                datetime | None = None,
     latest_model_only: bool          = False,
     bbox:              str    | None = None,
     view:              str           = "points",
@@ -130,45 +131,43 @@ def list_forecasts(
     if to:
         query = query.filter(Forecast.predicted_for <= to)
 
-    # view=map: ближайший прогноз к at по каждой зоне
-    if view == "map":
-        # Выбираем прогноз с predicted_for ближайшим к at (не позже чем at + 30 мин)
-        latest_sq = (
-            db.query(
-                Forecast.zone_id.label("zone_id"),
-                func.max(Forecast.generated_at).label("max_gen"),
+    # Если указан at, независимо от view возвращаем по одному прогнозу на каждую зону.
+    # Логика:
+    # 1. выбираем predicted_for, ближайший к at;
+    # 2. если для этого predicted_for есть несколько версий,
+    #    берём самую позднюю по generated_at;
+    # 3. forecast_id.desc() нужен как стабильный tie-breaker.
+    if at is not None:
+        time_distance = func.abs(
+            func.extract("epoch", Forecast.predicted_for - at)
+        )
+
+        ranked_sq = (
+            query.with_entities(
+                Forecast.forecast_id.label("forecast_id"),
+                func.row_number().over(
+                    partition_by=Forecast.zone_id,
+                    order_by=(
+                        time_distance.asc(),
+                        Forecast.generated_at.desc(),
+                        Forecast.forecast_id.desc(),
+                    ),
+                ).label("rn"),
             )
-            .filter(Forecast.predicted_for <= at)
-            .group_by(Forecast.zone_id)
             .subquery()
         )
-        query = query.join(
-            latest_sq,
-            (Forecast.zone_id == latest_sq.c.zone_id)
-            & (Forecast.generated_at == latest_sq.c.max_gen),
-        ).filter(Forecast.predicted_for <= at)
 
-        if bbox:
-            min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
-            # Фильтруем по центроиду geometry зоны на Python,
-            # т.к. longitude/latitude нет в parking_zones напрямую
-            zone_ids_in_bbox = []
-            zones = db.query(ParkingZone).all()
-            for z in zones:
-                try:
-                    coords = z.geometry["coordinates"][0]
-                    z_lon = sum(c[0] for c in coords) / len(coords)
-                    z_lat = sum(c[1] for c in coords) / len(coords)
-                    if min_lon <= z_lon <= max_lon and min_lat <= z_lat <= max_lat:
-                        zone_ids_in_bbox.append(z.parking_zone_id)
-                except Exception:
-                    pass
-            query = query.filter(Forecast.zone_id.in_(zone_ids_in_bbox))
+        query = (
+            db.query(Forecast)
+            .join(ranked_sq, Forecast.forecast_id == ranked_sq.c.forecast_id)
+            .filter(ranked_sq.c.rn == 1)
+        )
 
-    # latest_model_only: последняя генерация по каждой зоне + predicted_for
+    # Если at не указан, но requested latest_model_only,
+    # оставляем старую логику: последняя генерация по каждой зоне + predicted_for.
     elif latest_model_only:
         latest_sq = (
-            db.query(
+            query.with_entities(
                 Forecast.zone_id.label("zone_id"),
                 Forecast.predicted_for.label("predicted_for"),
                 func.max(Forecast.generated_at).label("max_gen"),
@@ -176,12 +175,34 @@ def list_forecasts(
             .group_by(Forecast.zone_id, Forecast.predicted_for)
             .subquery()
         )
+
         query = query.join(
             latest_sq,
             (Forecast.zone_id == latest_sq.c.zone_id)
             & (Forecast.predicted_for == latest_sq.c.predicted_for)
             & (Forecast.generated_at == latest_sq.c.max_gen),
         )
+
+    # bbox имеет смысл только для карты, но теперь он не должен быть связан
+    # с выбором одного прогноза по at.
+    if view == "map" and bbox:
+        min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
+
+        zone_ids_in_bbox = []
+        zones = db.query(ParkingZone).all()
+
+        for z in zones:
+            try:
+                coords = z.geometry["coordinates"][0]
+                z_lon = sum(c[0] for c in coords) / len(coords)
+                z_lat = sum(c[1] for c in coords) / len(coords)
+
+                if min_lon <= z_lon <= max_lon and min_lat <= z_lat <= max_lat:
+                    zone_ids_in_bbox.append(z.parking_zone_id)
+            except Exception:
+                pass
+
+        query = query.filter(Forecast.zone_id.in_(zone_ids_in_bbox))
 
     forecasts = query.order_by(Forecast.predicted_for.asc()).all()
 

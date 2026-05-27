@@ -3,9 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
-
-
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 # GeoJSON Polygon и image_polygon пропускаются как Any —
 # валидация формата остаётся на совести клиента в MVP.
 
@@ -50,16 +48,19 @@ class ZoneMapItemResponse(BaseModel):
 
 
 class CreateZoneRequest(BaseModel):
-    camera_id:     int   = Field(ge=1)
-    zone_type:     Literal["parallel", "standard"]
-    capacity:      int   = Field(gt=0)
-    pay:           int   = Field(ge=0)
-    geometry:      Any               # GeoJSON Polygon
-    image_polygon: Any               # [[x,y]*4]
-    partner_id:    int | None = None
-    location_type: str | None = None
-    is_private:    bool | None = None
-    is_accessible: bool | None = None
+    model_config = ConfigDict(extra="allow")
+
+    camera_id:     Any | None = None
+    zone_type:     Any | None = None
+    capacity:      Any | None = None
+    pay:           Any | None = None
+    geometry:      Any | None = None
+    image_polygon: Any | None = None
+    partner_id:    Any | None = None
+    is_active:     Any | None = True
+    location_type: Any | None = None
+    is_private:    Any | None = None
+    is_accessible: Any | None = None
 
 
 class UpdateZoneRequest(BaseModel):

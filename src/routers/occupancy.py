@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Union, cast
+import ast
+import json
+from typing import Annotated, Any, Union, cast
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text, func
@@ -244,16 +250,56 @@ def list_occupancy(
     return [_serialize_obs(obs, db) for obs in observations]
 
 
+async def _parse_lenient_body(request: Request) -> dict[str, Any]:
+    raw = await request.body()
+
+    if not raw:
+        return {}
+
+    text = raw.decode("utf-8", errors="replace").strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error_description": "Request body must be JSON or Python-like dict"},
+            )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_description": "Request body must be an object"},
+        )
+
+    return data
+
 # ---------------------------------------------------------------------------
 # POST /occupancy/new
 # ---------------------------------------------------------------------------
 
 @router.post("/new", status_code=status.HTTP_201_CREATED)
-def create_observation(
-    body:         CreateOccupancyRequest,
+async def create_observation(
+    request:      Request,
     current_user: Annotated[User, require("occupancy.write")],
     db:           Annotated[Session, Depends(get_db)],
 ):
+    raw_body = await _parse_lenient_body(request)
+
+    try:
+        body = CreateOccupancyRequest.model_validate(raw_body)
+    except ValidationError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Invalid occupancy payload",
+                "errors": exc.errors(),
+            },
+        )
+
     zone = db.query(ParkingZone).filter(
         ParkingZone.parking_zone_id == body.zone_id
     ).one_or_none()

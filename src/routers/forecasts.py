@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -98,11 +99,11 @@ def list_forecasts(
     camera_id:         int    | None = None,
     partner_id:        int    | None = None,
     model_type:        str    | None = None,
-    generated_from:    str    | None = None,
-    generated_to:      str    | None = None,
-    from_:             str    | None = Query(None, alias="from"),
-    to:                str    | None = None,
-    at:                str    | None = None,
+    generated_from:    datetime | None = None,
+    generated_to:      datetime | None = None,
+    from_:             datetime | None = Query(None, alias="from"),
+    to:                datetime | None = None,
+    at:                datetime | None = None,
     latest_model_only: bool          = False,
     bbox:              str    | None = None,
     view:              str           = "points",
@@ -131,22 +132,34 @@ def list_forecasts(
         query = query.filter(Forecast.predicted_for <= to)
 
     # view=map: ближайший прогноз к at по каждой зоне
+    # view=map: ровно один наиболее подходящий прогноз к at по каждой зоне.
+    # Сначала выбираем predicted_for, ближайший к at, затем среди нескольких
+    # версий одного predicted_for берём самую позднюю generated_at.
     if view == "map":
-        # Выбираем прогноз с predicted_for ближайшим к at (не позже чем at + 30 мин)
-        latest_sq = (
-            db.query(
-                Forecast.zone_id.label("zone_id"),
-                func.max(Forecast.generated_at).label("max_gen"),
+        time_distance = func.abs(
+            func.extract("epoch", Forecast.predicted_for - at)
+        )
+
+        ranked_sq = (
+            query.with_entities(
+                Forecast.forecast_id.label("forecast_id"),
+                func.row_number().over(
+                    partition_by=Forecast.zone_id,
+                    order_by=(
+                        time_distance.asc(),
+                        Forecast.generated_at.desc(),
+                        Forecast.forecast_id.desc(),
+                    ),
+                ).label("rn"),
             )
-            .filter(Forecast.predicted_for <= at)
-            .group_by(Forecast.zone_id)
             .subquery()
         )
-        query = query.join(
-            latest_sq,
-            (Forecast.zone_id == latest_sq.c.zone_id)
-            & (Forecast.generated_at == latest_sq.c.max_gen),
-        ).filter(Forecast.predicted_for <= at)
+
+        query = (
+            db.query(Forecast)
+            .join(ranked_sq, Forecast.forecast_id == ranked_sq.c.forecast_id)
+            .filter(ranked_sq.c.rn == 1)
+        )
 
         if bbox:
             min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Union
+from typing import Annotated, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text, func
@@ -223,46 +223,77 @@ def create_observation(
     zone = db.query(ParkingZone).filter(
         ParkingZone.parking_zone_id == body.zone_id
     ).one_or_none()
+
     if zone is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail={"error_description": "Zone not found"})
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Zone not found"},
+        )
+
+    zone_camera_id = cast(int, zone.camera_id)
+    zone_partner_id = cast(int | None, zone.partner_id)
+    zone_occupancy_updated_at = cast(datetime | None, zone.occupancy_updated_at)
+    current_user_id = cast(int | None, current_user.user_id)
 
     capacity = body.capacity if body.capacity is not None else zone.capacity
 
     if body.occupied > capacity:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail={"error_description": "Validation error: occupied must be between 0 and capacity"})
-
-    # Уникальность (source_type, source_ref) — только если source_ref задан
-    if body.source_ref:
-        conflict = db.query(OccupancyObservation).filter_by(
-            source_type=body.source_type, source_ref=body.source_ref
-        ).one_or_none()
-        if conflict:
-            raise HTTPException(status.HTTP_409_CONFLICT,
-                                detail={"error_description": "Observation with this source_ref already exists"})
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Validation error: occupied must be between 0 and capacity"
+            },
+        )
 
     cl = _confidence_level(body.confidence)
+    now = datetime.now(timezone.utc)
 
-    obs = OccupancyObservation(
-        zone_id=body.zone_id,
-        camera_id=zone.camera_id,
-        partner_id=zone.partner_id,
-        source_type=body.source_type,
-        source_ref=body.source_ref,
-        capacity=capacity,
-        occupied=body.occupied,
-        confidence=body.confidence,
-        confidence_level=cl,
-        observed_at=body.observed_at,
-        ingested_at=datetime.now(timezone.utc),
-        metadata_json=body.metadata,
-        created_by_user_id=current_user.user_id,
-    )
-    db.add(obs)
+    # Если источник прислал стабильный source_ref, то повторный запрос
+    # должен обновлять существующее наблюдение, а не падать с 409.
+    obs: OccupancyObservation | None = None
 
-    # Обновляем денормализованные поля зоны, если наблюдение свежее
-    if zone.occupancy_updated_at is None or body.observed_at > zone.occupancy_updated_at:
+    if body.source_ref:
+        obs = db.query(OccupancyObservation).filter(
+            OccupancyObservation.source_type == body.source_type,
+            OccupancyObservation.source_ref == body.source_ref,
+        ).one_or_none()
+
+    # Если source_ref нет, считаем это новым наблюдением.
+    if obs is None:
+        obs = OccupancyObservation(
+            zone_id=body.zone_id,
+            camera_id=zone_camera_id,
+            partner_id=zone_partner_id,
+            source_type=body.source_type,
+            source_ref=body.source_ref,
+            capacity=capacity,
+            occupied=body.occupied,
+            confidence=body.confidence,
+            confidence_level=cl,
+            observed_at=body.observed_at,
+            ingested_at=now,
+            metadata_json=body.metadata,
+            created_by_user_id=current_user_id,
+        )
+        db.add(obs)
+    else:
+        obs.zone_id = body.zone_id
+        obs.camera_id = zone_camera_id
+        obs.partner_id = zone_partner_id
+        obs.capacity = capacity
+        obs.occupied = body.occupied
+        obs.confidence = body.confidence
+        obs.confidence_level = cl
+        obs.observed_at = body.observed_at
+        obs.ingested_at = now
+        obs.metadata_json = body.metadata
+
+        if obs.created_by_user_id is None:
+            obs.created_by_user_id = current_user.user_id
+
+    # Обновляем денормализованные поля parking_zones только если пришло
+    # самое свежее наблюдение или наблюдение с тем же временем.
+    if zone_occupancy_updated_at is None or body.observed_at >= zone_occupancy_updated_at:
         zone.occupied = body.occupied
         zone.confidence = body.confidence
         zone.confidence_level = cl
@@ -270,6 +301,7 @@ def create_observation(
 
     db.commit()
     db.refresh(obs)
+
     return {"observation_id": obs.observation_id}
 
 

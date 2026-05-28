@@ -244,6 +244,8 @@ class ParkingZone(Base):
     pay                = Column(Integer, nullable=False, default=0)
     geometry           = Column(JSONB, nullable=False)
     image_polygon      = Column(JSONB, nullable=False)
+    centroid_latitude = Column(Double, nullable=True)
+    centroid_longitude = Column(Double, nullable=True)
     partner_id         = Column(Integer, ForeignKey("partners.partner_id", ondelete="SET NULL"), nullable=True)
     created_by_user_id = Column(Integer, ForeignKey("users.user_id",       ondelete="SET NULL"), nullable=True)
     is_active          = Column(Boolean, default=True)

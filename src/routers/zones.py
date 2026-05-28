@@ -240,6 +240,86 @@ def _get_partner_id_or_none(db: Session, raw_partner_id: Any) -> int | None:
 
     return partner.partner_id
 
+
+def _compute_geometry_centroid(geometry: Any) -> tuple[float | None, float | None]:
+    """
+    Возвращает (latitude, longitude) для GeoJSON Polygon.
+
+    GeoJSON хранит точки как [longitude, latitude].
+    Если полигон плохой или вырожденный, fallback — среднее по валидным точкам.
+    """
+    if not isinstance(geometry, dict):
+        return None, None
+
+    if geometry.get("type") != "Polygon":
+        return None, None
+
+    coordinates = geometry.get("coordinates")
+
+    if not isinstance(coordinates, list) or not coordinates:
+        return None, None
+
+    outer_ring = coordinates[0]
+
+    if not isinstance(outer_ring, list):
+        return None, None
+
+    points: list[tuple[float, float]] = []
+
+    for raw_point in outer_ring:
+        if not isinstance(raw_point, list | tuple) or len(raw_point) < 2:
+            continue
+
+        try:
+            longitude = float(raw_point[0])
+            latitude = float(raw_point[1])
+        except (TypeError, ValueError):
+            continue
+
+        if -180 <= longitude <= 180 and -90 <= latitude <= 90:
+            points.append((longitude, latitude))
+
+    if not points:
+        return None, None
+
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+
+    if not points:
+        return None, None
+
+    # Если полигон нормальный, считаем геометрический центроид.
+    # Для маленьких парковочных зон приближение по lon/lat достаточно.
+    area2 = 0.0
+    centroid_lon_sum = 0.0
+    centroid_lat_sum = 0.0
+
+    if len(points) >= 3:
+        for index, current in enumerate(points):
+            next_point = points[(index + 1) % len(points)]
+
+            lon1, lat1 = current
+            lon2, lat2 = next_point
+
+            cross = lon1 * lat2 - lon2 * lat1
+
+            area2 += cross
+            centroid_lon_sum += (lon1 + lon2) * cross
+            centroid_lat_sum += (lat1 + lat2) * cross
+
+    if abs(area2) > 1e-12:
+        centroid_longitude = centroid_lon_sum / (3.0 * area2)
+        centroid_latitude = centroid_lat_sum / (3.0 * area2)
+
+        if -180 <= centroid_longitude <= 180 and -90 <= centroid_latitude <= 90:
+            return centroid_latitude, centroid_longitude
+
+    # Fallback для вырожденных зон, например когда все точки одинаковые.
+    centroid_longitude = sum(point[0] for point in points) / len(points)
+    centroid_latitude = sum(point[1] for point in points) / len(points)
+
+    return centroid_latitude, centroid_longitude
+
 # ---------------------------------------------------------------------------
 # POST /zones/new
 # ---------------------------------------------------------------------------
@@ -276,6 +356,8 @@ def create_zone(
         [],
     )
 
+    centroid_latitude, centroid_longitude = _compute_geometry_centroid(geometry)
+
     zone = ParkingZone(
         camera_id=camera.camera_id,
         zone_type=_normalize_zone_type(body.zone_type),
@@ -286,6 +368,8 @@ def create_zone(
         pay=pay,
         geometry=geometry,
         image_polygon=image_polygon,
+        centroid_latitude=centroid_latitude,
+        centroid_longitude=centroid_longitude,
         partner_id=_get_partner_id_or_none(db, body.partner_id),
         created_by_user_id=current_user.user_id,
         is_active=_to_bool(body.is_active, default=True),
@@ -345,6 +429,11 @@ def update_zone(
 
     for field, value in update_data.items():
         setattr(zone, field, value)
+
+    if "geometry" in update_data:
+        centroid_latitude, centroid_longitude = _compute_geometry_centroid(zone.geometry)
+        zone.centroid_latitude = centroid_latitude
+        zone.centroid_longitude = centroid_longitude
 
     now = datetime.now(timezone.utc)
     if occupied_changed:

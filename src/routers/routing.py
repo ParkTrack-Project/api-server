@@ -8,7 +8,7 @@ from typing import Annotated, Any, cast
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, text
+from sqlalchemy import func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -40,44 +40,43 @@ GEOAPIFY_ROUTEMATRIX_URL = "https://api.geoapify.com/v1/routematrix"
 GEOAPIFY_PROVIDER_NAME = "geoapify"
 GEOAPIFY_MODE = "drive"
 
-# Чтобы случайно не отправлять в Geoapify слишком большую матрицу.
-# Сначала зоны грубо сортируются по прямому расстоянию, потом лучшие идут в API.
-MAX_MATRIX_TARGETS = 200
+EARTH_RADIUS_METERS = 6_371_000
+METERS_PER_LATITUDE_DEGREE = 111_320
 
-PUBLIC_ROUTING_USER_EMAIL = "public-routing@parktrack.local"
+# Сколько парковок максимум отправляем в Geoapify Route Matrix.
+# Это главный ограничитель скорости и стоимости внешнего API.
+MAX_MATRIX_TARGETS = 80
+MIN_CHEAP_CANDIDATES_FOR_COMPARE = 40
 
+# Расширяем радиус постепенно. Если рядом нет парковок, дойдём до очень больших
+# радиусов и в самом конце до fallback без радиуса.
+RADIUS_STEPS_METERS: list[int | None] = [
+    500,
+    1_000,
+    2_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    None,
+]
 
-def _get_public_routing_user_id(db: Session) -> int:
-    """
-    /routing/new теперь публичный, но routes.user_id в БД NOT NULL.
-    Поэтому сохраняем публичные маршруты на технического пользователя.
-    """
-    result = db.execute(
-        text(
-            """
-            INSERT INTO users (
-                full_name,
-                email,
-                hashed_password,
-                global_role,
-                is_active
-            )
-            VALUES (
-                'Public Routing User',
-                :email,
-                'disabled-public-routing-user',
-                CAST('user' AS global_roles),
-                TRUE
-            )
-            ON CONFLICT (email)
-            DO UPDATE SET email = EXCLUDED.email
-            RETURNING user_id
-            """
-        ),
-        {"email": PUBLIC_ROUTING_USER_EMAIL},
-    )
+# parking -> destination считаем как пешее расстояние. Route Matrix используем для
+# origin -> parking, а не для полной матрицы parking -> destination, чтобы ускорить поиск.
+WALKING_SPEED_METERS_PER_SECOND = 1.35
+WALKING_DETOUR_FACTOR = 1.35
 
-    return int(result.scalar_one())
+SHORT_TRIP_SECONDS = 30 * 60
+FORECAST_OPPORTUNITY_FREE_COUNT = 2
+FORECAST_LOOKAROUND = timedelta(hours=2)
+
+# /routing/new публичный, но routes.user_id обычно NOT NULL.
+# Лучше задать PUBLIC_ROUTING_USER_ID в .env.
+PUBLIC_ROUTING_USER_ID_ENV = "PUBLIC_ROUTING_USER_ID"
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +91,28 @@ class RoutingProviderError(Exception):
 class _ZoneTarget:
     zone: ParkingZone
     point: GeoPoint
+    anchor_distance_meters: int
     current_occupied: int
     current_free_count: int
     current_confidence: float
+
+
+@dataclass(frozen=True)
+class _RoutedCandidate:
+    zone_target: _ZoneTarget
+    distance_from_origin_meters: int
+    duration_from_origin_seconds: int
+    distance_to_destination_meters: int | None
+    duration_to_destination_seconds: int | None
+    arrival_time: datetime
+
+
+@dataclass(frozen=True)
+class _ForecastView:
+    predicted_occupied: int | None
+    predicted_free_count: int | None
+    probability_free_space: float | None
+    forecast_confidence: float | None
 
 
 @dataclass(frozen=True)
@@ -112,18 +130,42 @@ def _enum_value(value: Any) -> str | None:
         return None
 
     enum_value = getattr(value, "value", None)
+
     if enum_value is not None:
         return str(enum_value)
 
     return str(value)
 
 
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value
+
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _datetime_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.timestamp()
+
+
+def _seconds_between(a: datetime, b: datetime) -> float:
+    return abs((_to_utc_naive(a) - _to_utc_naive(b)).total_seconds())
+
+
 def _serialize_route(route: Route) -> RouteResponse:
     candidate: RouteCandidate | None = None
+
     if route.selected_candidate:
         candidate = RouteCandidate.model_validate(route.selected_candidate)
 
     destination: GeoPoint | None = None
+
     if route.destination_latitude is not None and route.destination_longitude is not None:
         destination = GeoPoint(
             latitude=route.destination_latitude,
@@ -165,9 +207,7 @@ def _get_route_or_404(db: Session, route_id: int) -> Route:
 
 
 def _assert_owner_or_admin(route: Route, current_user: User) -> None:
-    is_admin = current_user.global_role == GlobalRole.admin
-
-    if not is_admin and route.user_id != current_user.user_id:
+    if current_user.global_role != GlobalRole.admin and route.user_id != current_user.user_id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={"error_description": "Access denied: not your route"},
@@ -181,7 +221,35 @@ def _provider_unavailable(exc: RoutingProviderError) -> HTTPException:
     )
 
 
-def _zone_centroid(zone: ParkingZone) -> GeoPoint | None:
+def _get_public_routing_user_id(db: Session) -> int:
+    raw_user_id = os.getenv(PUBLIC_ROUTING_USER_ID_ENV)
+
+    if raw_user_id:
+        try:
+            return int(raw_user_id)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error_description": f"{PUBLIC_ROUTING_USER_ID_ENV} must be integer"},
+            )
+
+    row = db.query(User.user_id).order_by(User.user_id.asc()).first()
+
+    if row is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": (
+                    "Cannot create public route: no users exist. "
+                    f"Create a technical user or set {PUBLIC_ROUTING_USER_ID_ENV}."
+                )
+            },
+        )
+
+    return int(row[0])
+
+
+def _zone_centroid_from_geometry(zone: ParkingZone) -> GeoPoint | None:
     geometry = zone.geometry
 
     if not isinstance(geometry, dict):
@@ -211,9 +279,23 @@ def _zone_centroid(zone: ParkingZone) -> GeoPoint | None:
             return None
 
 
-def _haversine_meters(a: GeoPoint, b: GeoPoint) -> int:
-    earth_radius_meters = 6_371_000
+def _zone_point(zone: ParkingZone) -> GeoPoint | None:
+    latitude = getattr(zone, "centroid_latitude", None)
+    longitude = getattr(zone, "centroid_longitude", None)
 
+    if latitude is None or longitude is None:
+        return _zone_centroid_from_geometry(zone)
+
+    try:
+        return GeoPoint(
+            latitude=float(latitude),
+            longitude=float(longitude),
+        )
+    except (TypeError, ValueError):
+        return _zone_centroid_from_geometry(zone)
+
+
+def _haversine_meters(a: GeoPoint, b: GeoPoint) -> int:
     lat1 = math.radians(a.latitude)
     lat2 = math.radians(b.latitude)
     delta_lat = math.radians(b.latitude - a.latitude)
@@ -224,11 +306,22 @@ def _haversine_meters(a: GeoPoint, b: GeoPoint) -> int:
         + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
     )
 
-    return int(2 * earth_radius_meters * math.asin(math.sqrt(h)))
+    return int(2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(h)))
+
+
+def _estimated_walking_seconds(distance_meters: int) -> int:
+    return int(distance_meters * WALKING_DETOUR_FACTOR / WALKING_SPEED_METERS_PER_SECOND)
+
+
+def _build_map_deeplink(destination: GeoPoint) -> str:
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&destination={destination.latitude},{destination.longitude}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Geoapify
+# Geoapify Route Matrix
 # ---------------------------------------------------------------------------
 
 def _geoapify_api_key() -> str:
@@ -310,7 +403,7 @@ def _matrix_cell(
         return None
 
     distance = cell.get("distance")
-    duration = cell.get("time")
+    duration = cell.get("time", cell.get("duration"))
 
     if distance is None or duration is None:
         return None
@@ -322,23 +415,59 @@ def _matrix_cell(
 
 
 # ---------------------------------------------------------------------------
-# Кандидаты
+# Быстрый SQL-отбор зон по centroid_latitude / centroid_longitude
 # ---------------------------------------------------------------------------
 
-def _query_zone_targets(
+def _longitude_bounds(longitude: float, delta: float) -> tuple[float, float, bool]:
+    min_lon = longitude - delta
+    max_lon = longitude + delta
+
+    if min_lon < -180:
+        return min_lon + 360, max_lon, True
+
+    if max_lon > 180:
+        return min_lon, max_lon - 360, True
+
+    return min_lon, max_lon, False
+
+
+def _radius_bounding_box(
+    center: GeoPoint,
+    radius_meters: int,
+) -> tuple[float, float, float, float, bool]:
+    lat_delta = math.degrees(radius_meters / EARTH_RADIUS_METERS)
+
+    min_lat = max(-90.0, center.latitude - lat_delta)
+    max_lat = min(90.0, center.latitude + lat_delta)
+
+    cos_lat = abs(math.cos(math.radians(center.latitude)))
+
+    if cos_lat < 1e-6:
+        lon_delta = 180.0
+    else:
+        lon_delta = min(
+            180.0,
+            math.degrees(radius_meters / (EARTH_RADIUS_METERS * cos_lat)),
+        )
+
+    min_lon, max_lon, wraps = _longitude_bounds(center.longitude, lon_delta)
+
+    return min_lat, max_lat, min_lon, max_lon, wraps
+
+
+def _base_zone_query(
     db: Session,
-    origin: GeoPoint,
     max_pay: int | None,
-    min_free_count: int | None,
-    min_confidence: float | None,
     include_accessible: bool | None,
     selected_zone_id: int | None,
-    use_forecast: bool,
-) -> list[_ZoneTarget]:
+):
     query = db.query(ParkingZone).filter(ParkingZone.is_active.is_(True))
 
     if selected_zone_id is not None:
-        query = query.filter(ParkingZone.parking_zone_id == selected_zone_id)
+        return query.filter(ParkingZone.parking_zone_id == selected_zone_id)
+
+    query = query.filter(ParkingZone.centroid_latitude.is_not(None))
+    query = query.filter(ParkingZone.centroid_longitude.is_not(None))
 
     if max_pay is not None:
         query = query.filter(ParkingZone.pay <= max_pay)
@@ -351,107 +480,591 @@ def _query_zone_targets(
             )
         )
 
-    zones = query.all()
-
-    targets: list[_ZoneTarget] = []
-
-    for zone in zones:
-        point = _zone_centroid(zone)
-
-        if point is None:
-            continue
-
-        capacity = max(int(zone.capacity or 0), 0)
-        occupied = max(int(zone.occupied or 0), 0)
-        free_count = max(capacity - occupied, 0)
-        confidence = float(zone.confidence or 0.0)
-
-        # Если forecast включён, min_free_count/min_confidence лучше проверять
-        # после прогноза к arrival_time. Здесь фильтруем только для current-mode.
-        if not use_forecast:
-            if min_free_count is not None and free_count < min_free_count:
-                continue
-
-            if min_confidence is not None and confidence < min_confidence:
-                continue
-
-        targets.append(
-            _ZoneTarget(
-                zone=zone,
-                point=point,
-                current_occupied=occupied,
-                current_free_count=free_count,
-                current_confidence=confidence,
-            )
-        )
-
-    targets.sort(key=lambda item: _haversine_meters(origin, item.point))
-
-    return targets[:MAX_MATRIX_TARGETS]
+    return query
 
 
-def _find_forecast_for_arrival(
-    db: Session,
-    zone_id: int,
-    arrival_time: datetime,
-) -> Forecast | None:
-    time_distance = func.abs(
-        func.extract("epoch", Forecast.predicted_for - arrival_time)
+def _apply_bounding_box_filter(query, center: GeoPoint, radius_meters: int):
+    min_lat, max_lat, min_lon, max_lon, wraps = _radius_bounding_box(
+        center=center,
+        radius_meters=radius_meters,
     )
 
-    return (
+    query = query.filter(ParkingZone.centroid_latitude >= min_lat)
+    query = query.filter(ParkingZone.centroid_latitude <= max_lat)
+
+    if wraps:
+        query = query.filter(
+            or_(
+                ParkingZone.centroid_longitude >= min_lon,
+                ParkingZone.centroid_longitude <= max_lon,
+            )
+        )
+    else:
+        query = query.filter(ParkingZone.centroid_longitude >= min_lon)
+        query = query.filter(ParkingZone.centroid_longitude <= max_lon)
+
+    return query
+
+
+def _approx_distance_expr(center: GeoPoint):
+    cos_lat = abs(math.cos(math.radians(center.latitude)))
+
+    latitude_meters = (
+        (ParkingZone.centroid_latitude - center.latitude)
+        * METERS_PER_LATITUDE_DEGREE
+    )
+
+    longitude_meters = (
+        (ParkingZone.centroid_longitude - center.longitude)
+        * METERS_PER_LATITUDE_DEGREE
+        * cos_lat
+    )
+
+    return func.sqrt(
+        func.power(latitude_meters, 2)
+        + func.power(longitude_meters, 2)
+    )
+
+
+def _zone_to_target(zone: ParkingZone, anchor: GeoPoint) -> _ZoneTarget | None:
+    point = _zone_point(zone)
+
+    if point is None:
+        return None
+
+    capacity = max(int(zone.capacity or 0), 0)
+    occupied = max(int(zone.occupied or 0), 0)
+    occupied = min(occupied, capacity)
+    free_count = max(capacity - occupied, 0)
+    confidence = max(0.0, min(float(zone.confidence or 0.0), 1.0))
+
+    return _ZoneTarget(
+        zone=zone,
+        point=point,
+        anchor_distance_meters=_haversine_meters(anchor, point),
+        current_occupied=occupied,
+        current_free_count=free_count,
+        current_confidence=confidence,
+    )
+
+
+def _required_pool_size(limit: int) -> int:
+    return min(
+        MAX_MATRIX_TARGETS,
+        max(MIN_CHEAP_CANDIDATES_FOR_COMPARE, limit * 8),
+    )
+
+
+def _radius_steps_for_request(
+    mode: str,
+    max_distance_to_destination_meters: int | None,
+) -> list[int | None]:
+    if mode != "route_to_destination" or max_distance_to_destination_meters is None:
+        return RADIUS_STEPS_METERS
+
+    limited_steps: list[int | None] = []
+
+    for radius in RADIUS_STEPS_METERS:
+        if radius is None:
+            break
+
+        if radius <= max_distance_to_destination_meters:
+            limited_steps.append(radius)
+
+    if max_distance_to_destination_meters not in limited_steps:
+        limited_steps.append(max_distance_to_destination_meters)
+
+    return limited_steps
+
+
+def _query_zone_targets_near_anchor(
+    db: Session,
+    anchor: GeoPoint,
+    mode: str,
+    max_pay: int | None,
+    include_accessible: bool | None,
+    max_distance_to_destination_meters: int | None,
+    limit: int,
+    selected_zone_id: int | None,
+) -> list[_ZoneTarget]:
+    required_count = _required_pool_size(limit)
+
+    if selected_zone_id is not None:
+        zone = (
+            _base_zone_query(
+                db=db,
+                max_pay=max_pay,
+                include_accessible=include_accessible,
+                selected_zone_id=selected_zone_id,
+            )
+            .one_or_none()
+        )
+
+        if zone is None:
+            return []
+
+        target = _zone_to_target(zone, anchor)
+
+        return [target] if target is not None else []
+
+    last_non_empty: list[_ZoneTarget] = []
+
+    for radius in _radius_steps_for_request(
+        mode=mode,
+        max_distance_to_destination_meters=max_distance_to_destination_meters,
+    ):
+        query = _base_zone_query(
+            db=db,
+            max_pay=max_pay,
+            include_accessible=include_accessible,
+            selected_zone_id=None,
+        )
+
+        if radius is not None:
+            query = _apply_bounding_box_filter(
+                query=query,
+                center=anchor,
+                radius_meters=radius,
+            )
+
+        zones = (
+            query
+            .order_by(_approx_distance_expr(anchor).asc())
+            .limit(MAX_MATRIX_TARGETS)
+            .all()
+        )
+
+        targets: list[_ZoneTarget] = []
+
+        for zone in zones:
+            target = _zone_to_target(zone, anchor)
+
+            if target is None:
+                continue
+
+            # Bounding box шире круга, поэтому точно проверяем радиус в Python.
+            if radius is None or target.anchor_distance_meters <= radius:
+                targets.append(target)
+
+        targets.sort(key=lambda item: item.anchor_distance_meters)
+
+        if targets:
+            last_non_empty = targets
+
+        if len(targets) >= required_count:
+            return targets[:MAX_MATRIX_TARGETS]
+
+    return last_non_empty[:MAX_MATRIX_TARGETS]
+
+
+# ---------------------------------------------------------------------------
+# Прогнозы
+# ---------------------------------------------------------------------------
+
+def _load_forecasts_for_candidates(
+    db: Session,
+    zone_ids: list[int],
+    min_arrival: datetime,
+    max_arrival: datetime,
+) -> dict[int, list[Forecast]]:
+    if not zone_ids:
+        return {}
+
+    from_time = _to_utc_naive(min_arrival - FORECAST_LOOKAROUND)
+    to_time = _to_utc_naive(max_arrival + FORECAST_LOOKAROUND)
+
+    rows = (
         db.query(Forecast)
-        .filter(Forecast.zone_id == zone_id)
+        .filter(Forecast.zone_id.in_(zone_ids))
+        .filter(Forecast.predicted_for >= from_time)
+        .filter(Forecast.predicted_for <= to_time)
         .order_by(
-            time_distance.asc(),
+            Forecast.zone_id.asc(),
+            Forecast.predicted_for.asc(),
             Forecast.generated_at.desc(),
             Forecast.forecast_id.desc(),
         )
-        .first()
+        .all()
+    )
+
+    result: dict[int, list[Forecast]] = {}
+
+    for forecast in rows:
+        result.setdefault(int(forecast.zone_id), []).append(forecast)
+
+    return result
+
+
+def _pick_forecast_for_arrival(
+    forecasts: list[Forecast],
+    arrival_time: datetime,
+) -> Forecast | None:
+    if not forecasts:
+        return None
+
+    return min(
+        forecasts,
+        key=lambda forecast: (
+            _seconds_between(forecast.predicted_for, arrival_time),
+            -_datetime_timestamp(forecast.generated_at),
+            -int(forecast.forecast_id),
+        ),
     )
 
 
-def _score_candidate(
-    pay: int,
-    capacity: int,
+def _forecast_view(zone_capacity: int, forecast: Forecast | None) -> _ForecastView:
+    if forecast is None:
+        return _ForecastView(
+            predicted_occupied=None,
+            predicted_free_count=None,
+            probability_free_space=None,
+            forecast_confidence=None,
+        )
+
+    forecast_capacity = max(int(forecast.capacity or zone_capacity), 0)
+    predicted_occupied = max(int(forecast.predicted_occupied or 0), 0)
+    predicted_occupied = min(predicted_occupied, forecast_capacity)
+    predicted_free_count = max(forecast_capacity - predicted_occupied, 0)
+
+    probability_free_space = (
+        max(0.0, min(float(forecast.probability_free_space), 1.0))
+        if forecast.probability_free_space is not None
+        else None
+    )
+
+    forecast_confidence = (
+        max(0.0, min(float(forecast.confidence), 1.0))
+        if forecast.confidence is not None
+        else None
+    )
+
+    return _ForecastView(
+        predicted_occupied=predicted_occupied,
+        predicted_free_count=predicted_free_count,
+        probability_free_space=probability_free_space,
+        forecast_confidence=forecast_confidence,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Умная оценка кандидата
+# ---------------------------------------------------------------------------
+
+def _effective_free_count(
+    current_free_count: int,
+    forecast_view: _ForecastView,
+    use_forecast: bool,
+) -> int:
+    if use_forecast and forecast_view.predicted_free_count is not None:
+        return forecast_view.predicted_free_count
+
+    return current_free_count
+
+
+def _effective_confidence(
+    current_confidence: float,
+    forecast_view: _ForecastView,
+    use_forecast: bool,
+) -> float:
+    if use_forecast and forecast_view.forecast_confidence is not None:
+        return forecast_view.forecast_confidence
+
+    return current_confidence
+
+
+def _availability_probability(
     effective_free_count: int,
+    forecast_view: _ForecastView,
+    use_forecast: bool,
+) -> float:
+    if use_forecast and forecast_view.probability_free_space is not None:
+        return forecast_view.probability_free_space
+
+    if effective_free_count >= 3:
+        return 0.85
+
+    if effective_free_count == 2:
+        return 0.70
+
+    if effective_free_count == 1:
+        return 0.50
+
+    return 0.05
+
+
+def _candidate_tier(
+    current_free_count: int,
+    effective_free_count: int,
+    probability_free_space: float,
     effective_confidence: float,
-    probability_free_space: float | None,
+    duration_from_origin_seconds: int,
+    requested_min_free_count: int | None,
+    use_forecast: bool,
+    forecast_view: _ForecastView,
+) -> int:
+    """
+    Чем меньше tier, тем лучше.
+
+    0 — отличный кандидат;
+    1 — хороший кандидат;
+    2 — сейчас занято, но прогноз к arrival_time хороший;
+    3 — рискованный, но возможный;
+    4 — запасной вариант;
+    5 — почти бесполезный вариант.
+    """
+    min_required = requested_min_free_count if requested_min_free_count is not None else 1
+
+    if effective_free_count >= max(3, min_required) and probability_free_space >= 0.65:
+        return 0
+
+    if effective_free_count >= min_required and probability_free_space >= 0.40:
+        return 1
+
+    if (
+        use_forecast
+        and current_free_count == 0
+        and forecast_view.predicted_free_count is not None
+        and forecast_view.predicted_free_count >= FORECAST_OPPORTUNITY_FREE_COUNT
+        and duration_from_origin_seconds >= 10 * 60
+        and (
+            forecast_view.probability_free_space is None
+            or forecast_view.probability_free_space >= 0.35
+        )
+    ):
+        return 2
+
+    if effective_free_count > 0:
+        return 3
+
+    if duration_from_origin_seconds <= SHORT_TRIP_SECONDS:
+        return 5
+
+    if effective_confidence < 0.35:
+        return 5
+
+    return 4
+
+
+def _price_bucket(pay: int) -> int:
+    if pay <= 0:
+        return 0
+
+    if pay <= 50:
+        return 1
+
+    if pay <= 150:
+        return 2
+
+    if pay <= 300:
+        return 3
+
+    return 4
+
+
+def _duration_bucket(seconds: int) -> int:
+    if seconds <= 10 * 60:
+        return 0
+
+    if seconds <= 20 * 60:
+        return 1
+
+    if seconds <= 40 * 60:
+        return 2
+
+    if seconds <= 60 * 60:
+        return 3
+
+    if seconds <= 2 * 60 * 60:
+        return 4
+
+    return 5
+
+
+def _walk_bucket(seconds: int | None) -> int:
+    if seconds is None:
+        return 0
+
+    if seconds <= 5 * 60:
+        return 0
+
+    if seconds <= 10 * 60:
+        return 1
+
+    if seconds <= 20 * 60:
+        return 2
+
+    if seconds <= 30 * 60:
+        return 3
+
+    return 4
+
+
+def _display_score(
+    tier: int,
+    effective_free_count: int,
+    probability_free_space: float,
+    effective_confidence: float,
     duration_from_origin_seconds: int,
     duration_to_destination_seconds: int | None,
+    pay: int,
 ) -> float:
-    free_ratio = effective_free_count / max(capacity, 1)
-    free_score = max(0.0, min(free_ratio, 1.0))
+    base_by_tier = {
+        0: 0.95,
+        1: 0.82,
+        2: 0.72,
+        3: 0.55,
+        4: 0.35,
+        5: 0.12,
+    }
 
-    probability_score = (
-        max(0.0, min(probability_free_space, 1.0))
-        if probability_free_space is not None
-        else (1.0 if effective_free_count > 0 else 0.0)
-    )
+    base = base_by_tier.get(tier, 0.10)
 
-    confidence_score = max(0.0, min(effective_confidence, 1.0))
-
-    # 15 минут — условно хорошее время до парковки.
-    origin_time_score = 1.0 / (1.0 + duration_from_origin_seconds / 900.0)
+    free_bonus = min(effective_free_count, 6) * 0.015
+    probability_bonus = probability_free_space * 0.05
+    confidence_bonus = effective_confidence * 0.03
+    duration_penalty = min(duration_from_origin_seconds / (2 * 60 * 60), 1.0) * 0.10
 
     if duration_to_destination_seconds is None:
-        destination_time_score = 1.0
+        walk_penalty = 0.0
     else:
-        # 5 минут — условно хорошее время от парковки до точки назначения.
-        destination_time_score = 1.0 / (1.0 + duration_to_destination_seconds / 300.0)
+        walk_penalty = min(duration_to_destination_seconds / (30 * 60), 1.0) * 0.08
 
-    price_score = 1.0 / (1.0 + pay / 100.0)
+    price_penalty = min(pay / 500.0, 1.0) * 0.04
 
     score = (
-        0.30 * probability_score
-        + 0.20 * free_score
-        + 0.20 * origin_time_score
-        + 0.15 * destination_time_score
-        + 0.10 * confidence_score
-        + 0.05 * price_score
+        base
+        + free_bonus
+        + probability_bonus
+        + confidence_bonus
+        - duration_penalty
+        - walk_penalty
+        - price_penalty
     )
 
-    return round(score, 6)
+    return round(max(0.0, min(score, 1.0)), 6)
+
+
+def _ranking_key(
+    candidate: RouteCandidate,
+    tier: int,
+    effective_free_count: int,
+    probability_free_space: float,
+    effective_confidence: float,
+) -> tuple[Any, ...]:
+    return (
+        tier,
+        _duration_bucket(candidate.duration_from_origin_seconds),
+        _walk_bucket(candidate.duration_to_destination_seconds),
+        -effective_free_count,
+        -probability_free_space,
+        _price_bucket(candidate.pay),
+        -effective_confidence,
+        candidate.duration_from_origin_seconds,
+        candidate.distance_from_origin_meters,
+        candidate.distance_to_destination_meters
+        if candidate.distance_to_destination_meters is not None
+        else 0,
+        candidate.pay,
+        candidate.zone_id,
+    )
+
+
+def _remove_unreasonable_detours(
+    candidates_with_meta: list[tuple[RouteCandidate, tuple[Any, ...], int]],
+    limit: int,
+    selected_zone_id: int | None,
+) -> list[tuple[RouteCandidate, tuple[Any, ...], int]]:
+    if selected_zone_id is not None:
+        return candidates_with_meta
+
+    if not candidates_with_meta:
+        return []
+
+    primary = [item for item in candidates_with_meta if item[2] <= 3]
+
+    if len(primary) < max(3, min(limit, 5)):
+        return candidates_with_meta
+
+    best_duration = min(item[0].duration_from_origin_seconds for item in primary)
+
+    # Не показываем вариант на 5 часов, если есть сопоставимые варианты за час.
+    max_reasonable_duration = max(
+        best_duration + 30 * 60,
+        int(best_duration * 2.5),
+    )
+
+    max_reasonable_duration = min(
+        max_reasonable_duration,
+        best_duration + 2 * 60 * 60,
+    )
+
+    reasonable: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
+    backup: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
+
+    for item in candidates_with_meta:
+        candidate = item[0]
+        tier = item[2]
+
+        if tier <= 3 and candidate.duration_from_origin_seconds <= max_reasonable_duration:
+            reasonable.append(item)
+        else:
+            backup.append(item)
+
+    if len(reasonable) >= limit:
+        return reasonable
+
+    return reasonable + backup
+
+
+# ---------------------------------------------------------------------------
+# Основной поиск кандидатов
+# ---------------------------------------------------------------------------
+
+def _route_zone_pool(
+    origin: GeoPoint,
+    destination: GeoPoint | None,
+    zone_targets: list[_ZoneTarget],
+) -> list[_RoutedCandidate]:
+    if not zone_targets:
+        return []
+
+    matrix = _geoapify_matrix(
+        sources=[origin],
+        targets=[item.point for item in zone_targets],
+    )
+
+    now = datetime.now(timezone.utc)
+    routed: list[_RoutedCandidate] = []
+
+    for index, item in enumerate(zone_targets):
+        from_origin = _matrix_cell(matrix, 0, index)
+
+        if from_origin is None:
+            continue
+
+        distance_from_origin, duration_from_origin = from_origin
+        arrival_time = now + timedelta(seconds=duration_from_origin)
+
+        distance_to_destination: int | None = None
+        duration_to_destination: int | None = None
+
+        if destination is not None:
+            direct_distance = _haversine_meters(item.point, destination)
+            distance_to_destination = int(direct_distance * WALKING_DETOUR_FACTOR)
+            duration_to_destination = _estimated_walking_seconds(direct_distance)
+
+        routed.append(
+            _RoutedCandidate(
+                zone_target=item,
+                distance_from_origin_meters=distance_from_origin,
+                duration_from_origin_seconds=duration_from_origin,
+                distance_to_destination_meters=distance_to_destination,
+                duration_to_destination_seconds=duration_to_destination,
+                arrival_time=arrival_time,
+            )
+        )
+
+    return routed
 
 
 def _search_candidates(
@@ -475,169 +1088,188 @@ def _search_candidates(
             detail={"error_description": "destination is required for mode=route_to_destination"},
         )
 
-    zone_targets = _query_zone_targets(
+    anchor = destination if mode == "route_to_destination" and destination is not None else origin
+
+    cheap_pool = _query_zone_targets_near_anchor(
         db=db,
-        origin=origin,
+        anchor=anchor,
+        mode=mode,
         max_pay=max_pay,
-        min_free_count=min_free_count,
-        min_confidence=min_confidence,
         include_accessible=include_accessible,
+        max_distance_to_destination_meters=max_distance_to_destination_meters,
+        limit=limit,
         selected_zone_id=selected_zone_id,
-        use_forecast=use_forecast,
     )
 
-    if not zone_targets:
+    routed_candidates = _route_zone_pool(
+        origin=origin,
+        destination=destination,
+        zone_targets=cheap_pool,
+    )
+
+    if not routed_candidates:
         return _CandidateSearchResult(candidates=[], total_candidates=0)
 
-    origin_matrix = _geoapify_matrix(
-        sources=[origin],
-        targets=[item.point for item in zone_targets],
-    )
+    filtered_by_route: list[_RoutedCandidate] = []
 
-    destination_matrix: list[list[dict[str, Any]]] | None = None
-    if destination is not None:
-        destination_matrix = _geoapify_matrix(
-            sources=[item.point for item in zone_targets],
-            targets=[destination],
-        )
-
-    now = datetime.now(timezone.utc)
-    candidates: list[RouteCandidate] = []
-
-    for index, item in enumerate(zone_targets):
-        from_origin = _matrix_cell(origin_matrix, 0, index)
-
-        if from_origin is None:
-            continue
-
-        distance_from_origin, duration_from_origin = from_origin
-
+    for routed in routed_candidates:
         if (
             max_duration_from_origin_seconds is not None
-            and duration_from_origin > max_duration_from_origin_seconds
+            and routed.duration_from_origin_seconds > max_duration_from_origin_seconds
         ):
             continue
 
-        distance_to_destination: int | None = None
-        duration_to_destination: int | None = None
+        if (
+            max_distance_to_destination_meters is not None
+            and routed.distance_to_destination_meters is not None
+            and routed.distance_to_destination_meters > max_distance_to_destination_meters
+        ):
+            continue
 
-        if destination_matrix is not None:
-            to_destination = _matrix_cell(destination_matrix, index, 0)
+        filtered_by_route.append(routed)
 
-            if to_destination is None:
-                continue
+    if not filtered_by_route:
+        return _CandidateSearchResult(candidates=[], total_candidates=0)
 
-            distance_to_destination, duration_to_destination = to_destination
+    min_arrival = min(item.arrival_time for item in filtered_by_route)
+    max_arrival = max(item.arrival_time for item in filtered_by_route)
 
-            if (
-                max_distance_to_destination_meters is not None
-                and distance_to_destination > max_distance_to_destination_meters
-            ):
-                continue
+    zone_ids = [
+        int(item.zone_target.zone.parking_zone_id)
+        for item in filtered_by_route
+    ]
 
-        zone = item.zone
+    forecasts_by_zone = (
+        _load_forecasts_for_candidates(
+            db=db,
+            zone_ids=zone_ids,
+            min_arrival=min_arrival,
+            max_arrival=max_arrival,
+        )
+        if use_forecast
+        else {}
+    )
+
+    candidates_with_meta: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
+
+    for routed in filtered_by_route:
+        target = routed.zone_target
+        zone = target.zone
+
         capacity = max(int(zone.capacity or 0), 0)
         pay = max(int(zone.pay or 0), 0)
 
-        predicted_for_arrival = now + timedelta(seconds=duration_from_origin)
-
-        predicted_occupied: int | None = None
-        predicted_free_count: int | None = None
-        probability_free_space: float | None = None
-        forecast_confidence: float | None = None
-
-        effective_free_count = item.current_free_count
-        effective_confidence = item.current_confidence
+        forecast = None
 
         if use_forecast:
-            forecast = _find_forecast_for_arrival(
-                db=db,
-                zone_id=int(zone.parking_zone_id),
-                arrival_time=predicted_for_arrival,
+            forecast = _pick_forecast_for_arrival(
+                forecasts_by_zone.get(int(zone.parking_zone_id), []),
+                routed.arrival_time,
             )
 
-            if forecast is not None:
-                forecast_capacity = int(forecast.capacity or capacity)
-                predicted_occupied = max(int(forecast.predicted_occupied or 0), 0)
-                predicted_free_count = max(forecast_capacity - predicted_occupied, 0)
-                probability_free_space = (
-                    float(forecast.probability_free_space)
-                    if forecast.probability_free_space is not None
-                    else None
-                )
-                forecast_confidence = (
-                    float(forecast.confidence)
-                    if forecast.confidence is not None
-                    else None
-                )
+        forecast_view = _forecast_view(
+            zone_capacity=capacity,
+            forecast=forecast,
+        )
 
-                effective_free_count = predicted_free_count
-                effective_confidence = (
-                    forecast_confidence
-                    if forecast_confidence is not None
-                    else item.current_confidence
-                )
+        effective_free_count = _effective_free_count(
+            current_free_count=target.current_free_count,
+            forecast_view=forecast_view,
+            use_forecast=use_forecast,
+        )
 
+        effective_confidence = _effective_confidence(
+            current_confidence=target.current_confidence,
+            forecast_view=forecast_view,
+            use_forecast=use_forecast,
+        )
+
+        probability_free_space = _availability_probability(
+            effective_free_count=effective_free_count,
+            forecast_view=forecast_view,
+            use_forecast=use_forecast,
+        )
+
+        # Явные пользовательские ограничения — жёсткие.
         if min_free_count is not None and effective_free_count < min_free_count:
             continue
 
         if min_confidence is not None and effective_confidence < min_confidence:
             continue
 
-        score = _score_candidate(
+        tier = _candidate_tier(
+            current_free_count=target.current_free_count,
+            effective_free_count=effective_free_count,
+            probability_free_space=probability_free_space,
+            effective_confidence=effective_confidence,
+            duration_from_origin_seconds=routed.duration_from_origin_seconds,
+            requested_min_free_count=min_free_count,
+            use_forecast=use_forecast,
+            forecast_view=forecast_view,
+        )
+
+        score = _display_score(
+            tier=tier,
+            effective_free_count=effective_free_count,
+            probability_free_space=probability_free_space,
+            effective_confidence=effective_confidence,
+            duration_from_origin_seconds=routed.duration_from_origin_seconds,
+            duration_to_destination_seconds=routed.duration_to_destination_seconds,
+            pay=pay,
+        )
+
+        candidate = RouteCandidate(
+            zone_id=int(zone.parking_zone_id),
+            camera_id=cast(int | None, zone.camera_id),
+            geometry=zone.geometry,
+            zone_type=_enum_value(zone.zone_type) or "unknown",
+            location_type=_enum_value(zone.location_type),
+            is_accessible=cast(bool | None, zone.is_accessible),
             pay=pay,
             capacity=capacity,
+            current_occupied=target.current_occupied,
+            current_free_count=target.current_free_count,
+            current_confidence=target.current_confidence,
+            predicted_for_arrival=routed.arrival_time,
+            predicted_occupied=forecast_view.predicted_occupied,
+            predicted_free_count=forecast_view.predicted_free_count,
+            probability_free_space=forecast_view.probability_free_space,
+            forecast_confidence=forecast_view.forecast_confidence,
+            distance_from_origin_meters=routed.distance_from_origin_meters,
+            duration_from_origin_seconds=routed.duration_from_origin_seconds,
+            distance_to_destination_meters=routed.distance_to_destination_meters,
+            duration_to_destination_seconds=routed.duration_to_destination_seconds,
+            score=score,
+            rank=0,
+        )
+
+        ranking_key = _ranking_key(
+            candidate=candidate,
+            tier=tier,
             effective_free_count=effective_free_count,
-            effective_confidence=effective_confidence,
             probability_free_space=probability_free_space,
-            duration_from_origin_seconds=duration_from_origin,
-            duration_to_destination_seconds=duration_to_destination,
+            effective_confidence=effective_confidence,
         )
 
-        candidates.append(
-            RouteCandidate(
-                zone_id=int(zone.parking_zone_id),
-                camera_id=cast(int | None, zone.camera_id),
-                geometry=zone.geometry,
-                zone_type=_enum_value(zone.zone_type) or "unknown",
-                location_type=_enum_value(zone.location_type),
-                is_accessible=cast(bool | None, zone.is_accessible),
-                pay=pay,
-                capacity=capacity,
-                current_occupied=item.current_occupied,
-                current_free_count=item.current_free_count,
-                current_confidence=item.current_confidence,
-                predicted_for_arrival=predicted_for_arrival,
-                predicted_occupied=predicted_occupied,
-                predicted_free_count=predicted_free_count,
-                probability_free_space=probability_free_space,
-                forecast_confidence=forecast_confidence,
-                distance_from_origin_meters=distance_from_origin,
-                duration_from_origin_seconds=duration_from_origin,
-                distance_to_destination_meters=distance_to_destination,
-                duration_to_destination_seconds=duration_to_destination,
-                score=score,
-                rank=0,
-            )
-        )
+        candidates_with_meta.append((candidate, ranking_key, tier))
 
-    candidates.sort(
-        key=lambda candidate: (
-            -candidate.score,
-            candidate.duration_from_origin_seconds,
-            candidate.distance_from_origin_meters,
-        )
+    candidates_with_meta.sort(key=lambda item: item[1])
+
+    candidates_with_meta = _remove_unreasonable_detours(
+        candidates_with_meta=candidates_with_meta,
+        limit=limit,
+        selected_zone_id=selected_zone_id,
     )
 
-    total_candidates = len(candidates)
+    total_candidates = len(candidates_with_meta)
 
-    ranked_candidates = [
-        candidate.model_copy(update={"rank": rank})
-        for rank, candidate in enumerate(candidates, start=1)
+    ranked = [
+        item[0].model_copy(update={"rank": rank})
+        for rank, item in enumerate(candidates_with_meta, start=1)
     ]
 
     return _CandidateSearchResult(
-        candidates=ranked_candidates[:limit],
+        candidates=ranked[:limit],
         total_candidates=total_candidates,
     )
 
@@ -676,7 +1308,7 @@ def _selected_candidate_or_422(
 
 
 # ---------------------------------------------------------------------------
-# POST /routing/search
+# POST /routing/search — публичный поиск без авторизации
 # ---------------------------------------------------------------------------
 
 @router.post("/search", response_model=SearchRoutingResponse)
@@ -715,7 +1347,7 @@ def search_routing(
 
 
 # ---------------------------------------------------------------------------
-# POST /routing/new
+# POST /routing/new — публичное построение и сохранение маршрута
 # ---------------------------------------------------------------------------
 
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
@@ -765,6 +1397,20 @@ def create_route(
     now = datetime.now(timezone.utc)
     public_user_id = _get_public_routing_user_id(db)
 
+    selected_zone = (
+        db.query(ParkingZone)
+        .filter(ParkingZone.parking_zone_id == best.zone_id)
+        .one_or_none()
+    )
+
+    zone_point = body.origin
+
+    if selected_zone is not None:
+        centroid = _zone_point(selected_zone)
+
+        if centroid is not None:
+            zone_point = centroid
+
     route = Route(
         user_id=public_user_id,
         mode=RouteMode(body.mode),
@@ -778,7 +1424,7 @@ def create_route(
         eta_seconds=best.duration_from_origin_seconds,
         arrival_time=best.predicted_for_arrival,
         polyline=None,
-        deeplink_url=None,
+        deeplink_url=_build_map_deeplink(zone_point),
         status=RouteStatus.active,
         created_at=now,
         updated_at=now,
@@ -802,7 +1448,7 @@ def create_route(
 
 
 # ---------------------------------------------------------------------------
-# GET /routing
+# GET /routing — маршруты текущего пользователя
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=RouteListResponse)
@@ -888,7 +1534,6 @@ def update_route(
     if body.status is not None:
         route.status = RouteStatus(body.status)
 
-    # provider в request оставляем для совместимости, но фактически работаем через Geoapify.
     if body.provider is not None:
         route.provider = GEOAPIFY_PROVIDER_NAME
 
@@ -930,13 +1575,17 @@ def update_route(
         except RoutingProviderError as exc:
             raise _provider_unavailable(exc) from exc
 
+        centroid = _zone_point(zone)
+
         route.provider = GEOAPIFY_PROVIDER_NAME
         route.selected_zone_id = body.selected_zone_id
         route.selected_candidate = candidate.model_dump(mode="json")
         route.eta_seconds = candidate.duration_from_origin_seconds
         route.arrival_time = candidate.predicted_for_arrival
         route.polyline = None
-        route.deeplink_url = None
+
+        if centroid is not None:
+            route.deeplink_url = _build_map_deeplink(centroid)
 
     route.updated_at = datetime.now(timezone.utc)
 

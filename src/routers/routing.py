@@ -26,6 +26,7 @@ from ..dependencies import require
 from ..schemas.routing import (
     CreateRouteRequest,
     GeoPoint,
+    RankingExplanation,
     RouteCandidate,
     RouteListResponse,
     RouteResponse,
@@ -36,6 +37,11 @@ from ..schemas.routing import (
 
 router = APIRouter(prefix="/routing", tags=["Routing"])
 
+
+# ---------------------------------------------------------------------------
+# Константы
+# ---------------------------------------------------------------------------
+
 GEOAPIFY_ROUTEMATRIX_URL = "https://api.geoapify.com/v1/routematrix"
 GEOAPIFY_PROVIDER_NAME = "geoapify"
 GEOAPIFY_MODE = "drive"
@@ -43,13 +49,10 @@ GEOAPIFY_MODE = "drive"
 EARTH_RADIUS_METERS = 6_371_000
 METERS_PER_LATITUDE_DEGREE = 111_320
 
-# Сколько парковок максимум отправляем в Geoapify Route Matrix.
-# Это главный ограничитель скорости и стоимости внешнего API.
+MAX_CLUSTER_CONTEXT_TARGETS = 300
 MAX_MATRIX_TARGETS = 80
-MIN_CHEAP_CANDIDATES_FOR_COMPARE = 40
+MIN_CLUSTER_CONTEXT_FOR_COMPARE = 80
 
-# Расширяем радиус постепенно. Если рядом нет парковок, дойдём до очень больших
-# радиусов и в самом конце до fallback без радиуса.
 RADIUS_STEPS_METERS: list[int | None] = [
     500,
     1_000,
@@ -65,17 +68,14 @@ RADIUS_STEPS_METERS: list[int | None] = [
     None,
 ]
 
-# parking -> destination считаем как пешее расстояние. Route Matrix используем для
-# origin -> parking, а не для полной матрицы parking -> destination, чтобы ускорить поиск.
+CLUSTER_RADIUS_METERS = 500
+GOOD_ALTERNATIVE_MIN_PROBABILITY = 0.35
+
 WALKING_SPEED_METERS_PER_SECOND = 1.35
 WALKING_DETOUR_FACTOR = 1.35
 
-SHORT_TRIP_SECONDS = 30 * 60
-FORECAST_OPPORTUNITY_FREE_COUNT = 2
 FORECAST_LOOKAROUND = timedelta(hours=2)
 
-# /routing/new публичный, но routes.user_id обычно NOT NULL.
-# Лучше задать PUBLIC_ROUTING_USER_ID в .env.
 PUBLIC_ROUTING_USER_ID_ENV = "PUBLIC_ROUTING_USER_ID"
 
 
@@ -113,6 +113,41 @@ class _ForecastView:
     predicted_free_count: int | None
     probability_free_space: float | None
     forecast_confidence: float | None
+
+
+@dataclass(frozen=True)
+class _ClusterMetrics:
+    cluster_strength: float
+    nearby_alternative_count: int
+    nearby_good_alternative_count: int
+    nearby_effective_free_count: int
+    best_nearby_probability: float
+    nearest_good_alternative_distance_meters: int | None
+
+
+@dataclass
+class _CandidateContext:
+    candidate: RouteCandidate
+    tier: int
+    tier_label: str
+
+    effective_free_count: int
+    effective_confidence: float
+    availability_probability: float
+    availability_strength: float
+    cluster_metrics: _ClusterMetrics
+
+    base_cost_seconds: float
+    generalized_cost_seconds: float
+
+    price_penalty_seconds: float
+    scarcity_penalty_seconds: float
+    confidence_penalty_seconds: float
+    cluster_bonus_seconds: float
+    availability_bonus_seconds: float
+
+    peer_better_availability_penalty_seconds: float = 0.0
+    unreasonable_detour_penalty_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -156,6 +191,24 @@ def _datetime_timestamp(value: datetime | None) -> float:
 
 def _seconds_between(a: datetime, b: datetime) -> float:
     return abs((_to_utc_naive(a) - _to_utc_naive(b)).total_seconds())
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_float(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(value, max_value))
 
 
 def _serialize_route(route: Route) -> RouteResponse:
@@ -230,7 +283,9 @@ def _get_public_routing_user_id(db: Session) -> int:
         except ValueError:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"error_description": f"{PUBLIC_ROUTING_USER_ID_ENV} must be integer"},
+                detail={
+                    "error_description": f"{PUBLIC_ROUTING_USER_ID_ENV} must be integer"
+                },
             )
 
     row = db.query(User.user_id).order_by(User.user_id.asc()).first()
@@ -248,6 +303,35 @@ def _get_public_routing_user_id(db: Session) -> int:
 
     return int(row[0])
 
+
+def _haversine_meters(a: GeoPoint, b: GeoPoint) -> int:
+    lat1 = math.radians(a.latitude)
+    lat2 = math.radians(b.latitude)
+    delta_lat = math.radians(b.latitude - a.latitude)
+    delta_lon = math.radians(b.longitude - a.longitude)
+
+    h = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+
+    return int(2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(h)))
+
+
+def _estimated_walking_seconds(distance_meters: int) -> int:
+    return int(distance_meters * WALKING_DETOUR_FACTOR / WALKING_SPEED_METERS_PER_SECOND)
+
+
+def _build_map_deeplink(destination: GeoPoint) -> str:
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&destination={destination.latitude},{destination.longitude}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Центроид зоны
+# ---------------------------------------------------------------------------
 
 def _zone_centroid_from_geometry(zone: ParkingZone) -> GeoPoint | None:
     geometry = zone.geometry
@@ -279,7 +363,7 @@ def _zone_centroid_from_geometry(zone: ParkingZone) -> GeoPoint | None:
             return None
 
 
-def _zone_point(zone: ParkingZone) -> GeoPoint | None:
+def _zone_point_from_centroid_columns(zone: ParkingZone) -> GeoPoint | None:
     latitude = getattr(zone, "centroid_latitude", None)
     longitude = getattr(zone, "centroid_longitude", None)
 
@@ -295,33 +379,8 @@ def _zone_point(zone: ParkingZone) -> GeoPoint | None:
         return _zone_centroid_from_geometry(zone)
 
 
-def _haversine_meters(a: GeoPoint, b: GeoPoint) -> int:
-    lat1 = math.radians(a.latitude)
-    lat2 = math.radians(b.latitude)
-    delta_lat = math.radians(b.latitude - a.latitude)
-    delta_lon = math.radians(b.longitude - a.longitude)
-
-    h = (
-        math.sin(delta_lat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
-    )
-
-    return int(2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(h)))
-
-
-def _estimated_walking_seconds(distance_meters: int) -> int:
-    return int(distance_meters * WALKING_DETOUR_FACTOR / WALKING_SPEED_METERS_PER_SECOND)
-
-
-def _build_map_deeplink(destination: GeoPoint) -> str:
-    return (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&destination={destination.latitude},{destination.longitude}"
-    )
-
-
 # ---------------------------------------------------------------------------
-# Geoapify Route Matrix
+# Geoapify
 # ---------------------------------------------------------------------------
 
 def _geoapify_api_key() -> str:
@@ -340,8 +399,6 @@ def _geoapify_matrix(
     if not sources or not targets:
         return []
 
-    api_key = _geoapify_api_key()
-
     payload = {
         "mode": GEOAPIFY_MODE,
         "sources": [
@@ -357,7 +414,7 @@ def _geoapify_matrix(
     try:
         response = requests.post(
             GEOAPIFY_ROUTEMATRIX_URL,
-            params={"apiKey": api_key},
+            params={"apiKey": _geoapify_api_key()},
             headers={"Content-Type": "application/json"},
             json=payload,
             timeout=15,
@@ -415,7 +472,7 @@ def _matrix_cell(
 
 
 # ---------------------------------------------------------------------------
-# Быстрый SQL-отбор зон по centroid_latitude / centroid_longitude
+# SQL radius search
 # ---------------------------------------------------------------------------
 
 def _longitude_bounds(longitude: float, delta: float) -> tuple[float, float, bool]:
@@ -483,7 +540,11 @@ def _base_zone_query(
     return query
 
 
-def _apply_bounding_box_filter(query, center: GeoPoint, radius_meters: int):
+def _apply_bounding_box_filter(
+    query,
+    center: GeoPoint,
+    radius_meters: int,
+):
     min_lat, max_lat, min_lon, max_lon, wraps = _radius_bounding_box(
         center=center,
         radius_meters=radius_meters,
@@ -527,16 +588,17 @@ def _approx_distance_expr(center: GeoPoint):
 
 
 def _zone_to_target(zone: ParkingZone, anchor: GeoPoint) -> _ZoneTarget | None:
-    point = _zone_point(zone)
+    point = _zone_point_from_centroid_columns(zone)
 
     if point is None:
         return None
 
-    capacity = max(int(zone.capacity or 0), 0)
-    occupied = max(int(zone.occupied or 0), 0)
+    capacity = max(_safe_int(zone.capacity), 0)
+    occupied = max(_safe_int(zone.occupied), 0)
     occupied = min(occupied, capacity)
+
     free_count = max(capacity - occupied, 0)
-    confidence = max(0.0, min(float(zone.confidence or 0.0), 1.0))
+    confidence = _clamp_float(_safe_float(zone.confidence), 0.0, 1.0)
 
     return _ZoneTarget(
         zone=zone,
@@ -548,10 +610,10 @@ def _zone_to_target(zone: ParkingZone, anchor: GeoPoint) -> _ZoneTarget | None:
     )
 
 
-def _required_pool_size(limit: int) -> int:
+def _required_cluster_pool_size(limit: int) -> int:
     return min(
-        MAX_MATRIX_TARGETS,
-        max(MIN_CHEAP_CANDIDATES_FOR_COMPARE, limit * 8),
+        MAX_CLUSTER_CONTEXT_TARGETS,
+        max(MIN_CLUSTER_CONTEXT_FOR_COMPARE, limit * 12),
     )
 
 
@@ -587,7 +649,7 @@ def _query_zone_targets_near_anchor(
     limit: int,
     selected_zone_id: int | None,
 ) -> list[_ZoneTarget]:
-    required_count = _required_pool_size(limit)
+    required_count = _required_cluster_pool_size(limit)
 
     if selected_zone_id is not None:
         zone = (
@@ -630,7 +692,7 @@ def _query_zone_targets_near_anchor(
         zones = (
             query
             .order_by(_approx_distance_expr(anchor).asc())
-            .limit(MAX_MATRIX_TARGETS)
+            .limit(MAX_CLUSTER_CONTEXT_TARGETS)
             .all()
         )
 
@@ -642,7 +704,6 @@ def _query_zone_targets_near_anchor(
             if target is None:
                 continue
 
-            # Bounding box шире круга, поэтому точно проверяем радиус в Python.
             if radius is None or target.anchor_distance_meters <= radius:
                 targets.append(target)
 
@@ -652,16 +713,41 @@ def _query_zone_targets_near_anchor(
             last_non_empty = targets
 
         if len(targets) >= required_count:
-            return targets[:MAX_MATRIX_TARGETS]
+            return targets[:MAX_CLUSTER_CONTEXT_TARGETS]
 
-    return last_non_empty[:MAX_MATRIX_TARGETS]
+    return last_non_empty[:MAX_CLUSTER_CONTEXT_TARGETS]
+
+
+def _matrix_preselection_key(target: _ZoneTarget) -> tuple[Any, ...]:
+    distance_band = target.anchor_distance_meters // 500
+
+    if target.current_free_count >= 3:
+        availability_band = 0
+    elif target.current_free_count >= 1:
+        availability_band = 1
+    else:
+        availability_band = 2
+
+    pay = max(_safe_int(target.zone.pay), 0)
+
+    return (
+        distance_band,
+        availability_band,
+        target.anchor_distance_meters,
+        pay,
+        int(target.zone.parking_zone_id),
+    )
+
+
+def _select_matrix_targets(cluster_pool: list[_ZoneTarget]) -> list[_ZoneTarget]:
+    return sorted(cluster_pool, key=_matrix_preselection_key)[:MAX_MATRIX_TARGETS]
 
 
 # ---------------------------------------------------------------------------
-# Прогнозы
+# Forecast helpers
 # ---------------------------------------------------------------------------
 
-def _load_forecasts_for_candidates(
+def _load_forecasts_for_zones(
     db: Session,
     zone_ids: list[int],
     min_arrival: datetime,
@@ -712,7 +798,10 @@ def _pick_forecast_for_arrival(
     )
 
 
-def _forecast_view(zone_capacity: int, forecast: Forecast | None) -> _ForecastView:
+def _forecast_view(
+    zone_capacity: int,
+    forecast: Forecast | None,
+) -> _ForecastView:
     if forecast is None:
         return _ForecastView(
             predicted_occupied=None,
@@ -721,19 +810,19 @@ def _forecast_view(zone_capacity: int, forecast: Forecast | None) -> _ForecastVi
             forecast_confidence=None,
         )
 
-    forecast_capacity = max(int(forecast.capacity or zone_capacity), 0)
-    predicted_occupied = max(int(forecast.predicted_occupied or 0), 0)
+    forecast_capacity = max(_safe_int(forecast.capacity, zone_capacity), 0)
+    predicted_occupied = max(_safe_int(forecast.predicted_occupied), 0)
     predicted_occupied = min(predicted_occupied, forecast_capacity)
     predicted_free_count = max(forecast_capacity - predicted_occupied, 0)
 
     probability_free_space = (
-        max(0.0, min(float(forecast.probability_free_space), 1.0))
+        _clamp_float(float(forecast.probability_free_space), 0.0, 1.0)
         if forecast.probability_free_space is not None
         else None
     )
 
     forecast_confidence = (
-        max(0.0, min(float(forecast.confidence), 1.0))
+        _clamp_float(float(forecast.confidence), 0.0, 1.0)
         if forecast.confidence is not None
         else None
     )
@@ -745,10 +834,6 @@ def _forecast_view(zone_capacity: int, forecast: Forecast | None) -> _ForecastVi
         forecast_confidence=forecast_confidence,
     )
 
-
-# ---------------------------------------------------------------------------
-# Умная оценка кандидата
-# ---------------------------------------------------------------------------
 
 def _effective_free_count(
     current_free_count: int,
@@ -780,214 +865,555 @@ def _availability_probability(
     if use_forecast and forecast_view.probability_free_space is not None:
         return forecast_view.probability_free_space
 
+    if effective_free_count >= 5:
+        return 0.92
+
     if effective_free_count >= 3:
-        return 0.85
+        return 0.82
 
     if effective_free_count == 2:
-        return 0.70
+        return 0.65
 
     if effective_free_count == 1:
-        return 0.50
+        return 0.42
 
-    return 0.05
+    return 0.04
 
 
-def _candidate_tier(
+# ---------------------------------------------------------------------------
+# Cluster / fallback alternatives
+# ---------------------------------------------------------------------------
+
+def _effective_state_for_target_at_arrival(
+    target: _ZoneTarget,
+    arrival_time: datetime,
+    forecasts_by_zone: dict[int, list[Forecast]],
+    use_forecast: bool,
+) -> tuple[int, float, float, _ForecastView]:
+    zone_id = int(target.zone.parking_zone_id)
+    capacity = max(_safe_int(target.zone.capacity), 0)
+
+    forecast = None
+
+    if use_forecast:
+        forecast = _pick_forecast_for_arrival(
+            forecasts_by_zone.get(zone_id, []),
+            arrival_time,
+        )
+
+    view = _forecast_view(
+        zone_capacity=capacity,
+        forecast=forecast,
+    )
+
+    effective_free = _effective_free_count(
+        current_free_count=target.current_free_count,
+        forecast_view=view,
+        use_forecast=use_forecast,
+    )
+
+    effective_confidence = _effective_confidence(
+        current_confidence=target.current_confidence,
+        forecast_view=view,
+        use_forecast=use_forecast,
+    )
+
+    probability = _availability_probability(
+        effective_free_count=effective_free,
+        forecast_view=view,
+        use_forecast=use_forecast,
+    )
+
+    return effective_free, effective_confidence, probability, view
+
+
+def _cluster_metrics(
+    candidate_target: _ZoneTarget,
+    arrival_time: datetime,
+    cluster_pool: list[_ZoneTarget],
+    forecasts_by_zone: dict[int, list[Forecast]],
+    use_forecast: bool,
+) -> _ClusterMetrics:
+    alternative_count = 0
+    good_alternative_count = 0
+    total_effective_free = 0
+    best_probability = 0.0
+    nearest_good_distance: int | None = None
+
+    for alternative in cluster_pool:
+        if alternative.zone.parking_zone_id == candidate_target.zone.parking_zone_id:
+            continue
+
+        distance = _haversine_meters(candidate_target.point, alternative.point)
+
+        if distance > CLUSTER_RADIUS_METERS:
+            continue
+
+        alternative_count += 1
+
+        effective_free, _, probability, _ = _effective_state_for_target_at_arrival(
+            target=alternative,
+            arrival_time=arrival_time,
+            forecasts_by_zone=forecasts_by_zone,
+            use_forecast=use_forecast,
+        )
+
+        total_effective_free += max(effective_free, 0)
+        best_probability = max(best_probability, probability)
+
+        is_good = effective_free >= 1 or probability >= GOOD_ALTERNATIVE_MIN_PROBABILITY
+
+        if is_good:
+            good_alternative_count += 1
+
+            if nearest_good_distance is None or distance < nearest_good_distance:
+                nearest_good_distance = distance
+
+    cluster_strength = (
+        0.45 * min(good_alternative_count / 3.0, 1.0)
+        + 0.40 * min(total_effective_free / 10.0, 1.0)
+        + 0.15 * best_probability
+    )
+
+    return _ClusterMetrics(
+        cluster_strength=round(_clamp_float(cluster_strength, 0.0, 1.0), 6),
+        nearby_alternative_count=alternative_count,
+        nearby_good_alternative_count=good_alternative_count,
+        nearby_effective_free_count=total_effective_free,
+        best_nearby_probability=round(best_probability, 6),
+        nearest_good_alternative_distance_meters=nearest_good_distance,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ranking
+# ---------------------------------------------------------------------------
+
+def _availability_strength(
+    effective_free_count: int,
+    capacity: int,
+    probability_free_space: float,
+) -> float:
+    if effective_free_count <= 0:
+        return round(probability_free_space * 0.20, 6)
+
+    free_count_score = min(effective_free_count / 4.0, 1.0)
+    free_ratio_score = min(effective_free_count / max(capacity, 1), 1.0)
+
+    strength = (
+        0.55 * free_count_score
+        + 0.30 * probability_free_space
+        + 0.15 * free_ratio_score
+    )
+
+    return round(_clamp_float(strength, 0.0, 1.0), 6)
+
+
+def _tier_for_candidate(
     current_free_count: int,
     effective_free_count: int,
     probability_free_space: float,
     effective_confidence: float,
     duration_from_origin_seconds: int,
-    requested_min_free_count: int | None,
+    cluster_strength: float,
     use_forecast: bool,
     forecast_view: _ForecastView,
-) -> int:
-    """
-    Чем меньше tier, тем лучше.
+) -> tuple[int, str]:
+    if effective_free_count >= 3 and probability_free_space >= 0.55:
+        return 0, "excellent"
 
-    0 — отличный кандидат;
-    1 — хороший кандидат;
-    2 — сейчас занято, но прогноз к arrival_time хороший;
-    3 — рискованный, но возможный;
-    4 — запасной вариант;
-    5 — почти бесполезный вариант.
-    """
-    min_required = requested_min_free_count if requested_min_free_count is not None else 1
+    if effective_free_count >= 2 and probability_free_space >= 0.40:
+        return 1, "good"
 
-    if effective_free_count >= max(3, min_required) and probability_free_space >= 0.65:
-        return 0
-
-    if effective_free_count >= min_required and probability_free_space >= 0.40:
-        return 1
+    if effective_free_count == 1 and (probability_free_space >= 0.45 or cluster_strength >= 0.45):
+        return 2, "scarce_but_usable"
 
     if (
         use_forecast
         and current_free_count == 0
         and forecast_view.predicted_free_count is not None
-        and forecast_view.predicted_free_count >= FORECAST_OPPORTUNITY_FREE_COUNT
-        and duration_from_origin_seconds >= 10 * 60
-        and (
-            forecast_view.probability_free_space is None
-            or forecast_view.probability_free_space >= 0.35
-        )
+        and forecast_view.predicted_free_count >= 2
+        and duration_from_origin_seconds >= 8 * 60
     ):
-        return 2
+        return 2, "forecast_opportunity"
 
-    if effective_free_count > 0:
-        return 3
+    if effective_free_count >= 1:
+        return 3, "risky"
 
-    if duration_from_origin_seconds <= SHORT_TRIP_SECONDS:
-        return 5
+    if cluster_strength >= 0.50:
+        return 4, "fallback_cluster_only"
 
     if effective_confidence < 0.35:
-        return 5
+        return 5, "poor_low_confidence"
 
-    return 4
-
-
-def _price_bucket(pay: int) -> int:
-    if pay <= 0:
-        return 0
-
-    if pay <= 50:
-        return 1
-
-    if pay <= 150:
-        return 2
-
-    if pay <= 300:
-        return 3
-
-    return 4
+    return 5, "poor_no_spaces"
 
 
-def _duration_bucket(seconds: int) -> int:
-    if seconds <= 10 * 60:
-        return 0
-
-    if seconds <= 20 * 60:
-        return 1
-
-    if seconds <= 40 * 60:
-        return 2
-
-    if seconds <= 60 * 60:
-        return 3
-
-    if seconds <= 2 * 60 * 60:
-        return 4
-
-    return 5
-
-
-def _walk_bucket(seconds: int | None) -> int:
-    if seconds is None:
-        return 0
-
-    if seconds <= 5 * 60:
-        return 0
-
-    if seconds <= 10 * 60:
-        return 1
-
-    if seconds <= 20 * 60:
-        return 2
-
-    if seconds <= 30 * 60:
-        return 3
-
-    return 4
-
-
-def _display_score(
-    tier: int,
+def _scarcity_penalty_seconds(
     effective_free_count: int,
     probability_free_space: float,
-    effective_confidence: float,
+    duration_from_origin_seconds: int,
+    cluster_strength: float,
+) -> float:
+    cluster_relief = cluster_strength * 450.0
+
+    if effective_free_count >= 4:
+        return 0.0
+
+    if effective_free_count == 3:
+        return max(0.0, 120.0 - cluster_relief * 0.25)
+
+    if effective_free_count == 2:
+        return max(0.0, 360.0 - cluster_relief * 0.50)
+
+    if effective_free_count == 1:
+        if duration_from_origin_seconds <= 10 * 60:
+            base = 600.0
+        elif duration_from_origin_seconds <= 30 * 60:
+            base = 1_050.0
+        else:
+            base = 1_500.0
+
+        probability_relief = probability_free_space * 350.0
+
+        return max(180.0, base - probability_relief - cluster_relief)
+
+    base = 4_200.0
+
+    if duration_from_origin_seconds <= 10 * 60:
+        base = 5_400.0
+
+    probability_relief = probability_free_space * 1_200.0
+
+    return max(1_200.0, base - probability_relief - cluster_relief)
+
+
+def _price_penalty_seconds(pay: int) -> float:
+    if pay <= 0:
+        return 0.0
+
+    if pay <= 50:
+        return 90.0
+
+    if pay <= 150:
+        return 240.0
+
+    if pay <= 300:
+        return 480.0
+
+    return 720.0
+
+
+def _confidence_penalty_seconds(confidence: float) -> float:
+    return (1.0 - _clamp_float(confidence, 0.0, 1.0)) * 300.0
+
+
+def _availability_bonus_seconds(
+    effective_free_count: int,
+    availability_strength: float,
+    probability_free_space: float,
+) -> float:
+    free_bonus = min(max(effective_free_count - 1, 0) * 220.0, 900.0)
+    strength_bonus = availability_strength * 300.0
+    probability_bonus = probability_free_space * 220.0
+
+    return free_bonus + strength_bonus + probability_bonus
+
+
+def _cluster_bonus_seconds(cluster_strength: float) -> float:
+    return cluster_strength * 750.0
+
+
+def _candidate_reasons(
+    tier_label: str,
+    effective_free_count: int,
+    current_free_count: int,
+    forecast_view: _ForecastView,
+    probability_free_space: float,
     duration_from_origin_seconds: int,
     duration_to_destination_seconds: int | None,
     pay: int,
-) -> float:
-    base_by_tier = {
-        0: 0.95,
-        1: 0.82,
-        2: 0.72,
-        3: 0.55,
-        4: 0.35,
-        5: 0.12,
-    }
+    cluster_metrics: _ClusterMetrics,
+    peer_penalty: float,
+    detour_penalty: float,
+) -> list[str]:
+    reasons: list[str] = []
 
-    base = base_by_tier.get(tier, 0.10)
+    reasons.append(f"quality_tier={tier_label}")
 
-    free_bonus = min(effective_free_count, 6) * 0.015
-    probability_bonus = probability_free_space * 0.05
-    confidence_bonus = effective_confidence * 0.03
-    duration_penalty = min(duration_from_origin_seconds / (2 * 60 * 60), 1.0) * 0.10
-
-    if duration_to_destination_seconds is None:
-        walk_penalty = 0.0
+    if duration_from_origin_seconds <= 10 * 60:
+        reasons.append("very_close_to_origin")
+    elif duration_from_origin_seconds <= 30 * 60:
+        reasons.append("reasonable_drive_time")
     else:
-        walk_penalty = min(duration_to_destination_seconds / (30 * 60), 1.0) * 0.08
+        reasons.append("long_drive_time")
 
-    price_penalty = min(pay / 500.0, 1.0) * 0.04
+    if duration_to_destination_seconds is not None:
+        if duration_to_destination_seconds <= 5 * 60:
+            reasons.append("very_close_to_destination_after_parking")
+        elif duration_to_destination_seconds <= 15 * 60:
+            reasons.append("acceptable_distance_to_destination_after_parking")
+        else:
+            reasons.append("far_from_destination_after_parking")
 
-    score = (
-        base
-        + free_bonus
-        + probability_bonus
-        + confidence_bonus
-        - duration_penalty
-        - walk_penalty
-        - price_penalty
+    if effective_free_count >= 3:
+        reasons.append("good_free_space_buffer")
+    elif effective_free_count == 2:
+        reasons.append("moderate_free_space_buffer")
+    elif effective_free_count == 1:
+        reasons.append("only_one_effective_free_space")
+    else:
+        reasons.append("no_effective_free_spaces")
+
+    if forecast_view.predicted_free_count is not None:
+        if forecast_view.predicted_free_count > current_free_count:
+            reasons.append("forecast_expects_spaces_to_free_up")
+        elif forecast_view.predicted_free_count < current_free_count:
+            reasons.append("forecast_expects_spaces_to_be_taken")
+
+    if probability_free_space >= 0.75:
+        reasons.append("high_probability_of_free_space")
+    elif probability_free_space < 0.30:
+        reasons.append("low_probability_of_free_space")
+
+    if pay <= 0:
+        reasons.append("free_parking")
+    elif pay >= 300:
+        reasons.append("expensive_parking")
+
+    if cluster_metrics.cluster_strength >= 0.60:
+        reasons.append("strong_nearby_fallback_cluster")
+    elif cluster_metrics.nearby_good_alternative_count == 0:
+        reasons.append("no_good_nearby_alternatives")
+
+    if peer_penalty > 0:
+        reasons.append("similar_nearby_candidate_has_better_availability")
+
+    if detour_penalty > 0:
+        reasons.append("penalized_as_unreasonable_detour")
+
+    return reasons
+
+
+def _build_ranking_context(
+    routed: _RoutedCandidate,
+    cluster_pool: list[_ZoneTarget],
+    forecasts_by_zone: dict[int, list[Forecast]],
+    use_forecast: bool,
+) -> _CandidateContext:
+    target = routed.zone_target
+    zone = target.zone
+    zone_id = int(zone.parking_zone_id)
+
+    capacity = max(_safe_int(zone.capacity), 0)
+    pay = max(_safe_int(zone.pay), 0)
+
+    effective_free, effective_confidence, probability, forecast_view = (
+        _effective_state_for_target_at_arrival(
+            target=target,
+            arrival_time=routed.arrival_time,
+            forecasts_by_zone=forecasts_by_zone,
+            use_forecast=use_forecast,
+        )
     )
 
-    return round(max(0.0, min(score, 1.0)), 6)
+    cluster = _cluster_metrics(
+        candidate_target=target,
+        arrival_time=routed.arrival_time,
+        cluster_pool=cluster_pool,
+        forecasts_by_zone=forecasts_by_zone,
+        use_forecast=use_forecast,
+    )
 
+    availability_strength = _availability_strength(
+        effective_free_count=effective_free,
+        capacity=capacity,
+        probability_free_space=probability,
+    )
 
-def _ranking_key(
-    candidate: RouteCandidate,
-    tier: int,
-    effective_free_count: int,
-    probability_free_space: float,
-    effective_confidence: float,
-) -> tuple[Any, ...]:
-    return (
-        tier,
-        _duration_bucket(candidate.duration_from_origin_seconds),
-        _walk_bucket(candidate.duration_to_destination_seconds),
-        -effective_free_count,
-        -probability_free_space,
-        _price_bucket(candidate.pay),
-        -effective_confidence,
-        candidate.duration_from_origin_seconds,
-        candidate.distance_from_origin_meters,
-        candidate.distance_to_destination_meters
-        if candidate.distance_to_destination_meters is not None
-        else 0,
-        candidate.pay,
-        candidate.zone_id,
+    tier, tier_label = _tier_for_candidate(
+        current_free_count=target.current_free_count,
+        effective_free_count=effective_free,
+        probability_free_space=probability,
+        effective_confidence=effective_confidence,
+        duration_from_origin_seconds=routed.duration_from_origin_seconds,
+        cluster_strength=cluster.cluster_strength,
+        use_forecast=use_forecast,
+        forecast_view=forecast_view,
+    )
+
+    scarcity_penalty = _scarcity_penalty_seconds(
+        effective_free_count=effective_free,
+        probability_free_space=probability,
+        duration_from_origin_seconds=routed.duration_from_origin_seconds,
+        cluster_strength=cluster.cluster_strength,
+    )
+
+    price_penalty = _price_penalty_seconds(pay)
+    confidence_penalty = _confidence_penalty_seconds(effective_confidence)
+
+    availability_bonus = _availability_bonus_seconds(
+        effective_free_count=effective_free,
+        availability_strength=availability_strength,
+        probability_free_space=probability,
+    )
+
+    cluster_bonus = _cluster_bonus_seconds(cluster.cluster_strength)
+
+    walk_seconds = routed.duration_to_destination_seconds or 0
+
+    # Главная база стоимости — время/расстояние до парковки.
+    # Остальные факторы — секунды штрафа/бонуса.
+    base_cost = (
+        float(routed.duration_from_origin_seconds)
+        + 0.55 * float(walk_seconds)
+    )
+
+    generalized_cost = (
+        base_cost
+        + scarcity_penalty
+        + price_penalty
+        + confidence_penalty
+        - availability_bonus
+        - cluster_bonus
+    )
+
+    generalized_cost = max(0.0, generalized_cost)
+
+    explanation = RankingExplanation(
+        tier=tier,
+        tier_label=tier_label,
+        generalized_cost_seconds=round(generalized_cost, 3),
+        base_drive_seconds=routed.duration_from_origin_seconds,
+        walk_to_destination_seconds=routed.duration_to_destination_seconds,
+        current_free_count=target.current_free_count,
+        predicted_free_count=forecast_view.predicted_free_count,
+        effective_free_count=effective_free,
+        availability_probability=round(probability, 6),
+        availability_strength=availability_strength,
+        cluster_strength=cluster.cluster_strength,
+        nearby_alternative_count=cluster.nearby_alternative_count,
+        nearby_good_alternative_count=cluster.nearby_good_alternative_count,
+        nearby_effective_free_count=cluster.nearby_effective_free_count,
+        nearest_good_alternative_distance_meters=cluster.nearest_good_alternative_distance_meters,
+        price_penalty_seconds=round(price_penalty, 3),
+        scarcity_penalty_seconds=round(scarcity_penalty, 3),
+        confidence_penalty_seconds=round(confidence_penalty, 3),
+        cluster_bonus_seconds=round(cluster_bonus, 3),
+        availability_bonus_seconds=round(availability_bonus, 3),
+        peer_better_availability_penalty_seconds=0.0,
+        unreasonable_detour_penalty_seconds=0.0,
+        reasons=[],
+    )
+
+    score = round(1.0 / (1.0 + generalized_cost / 1_800.0), 6)
+
+    candidate = RouteCandidate(
+        zone_id=zone_id,
+        camera_id=cast(int | None, zone.camera_id),
+        geometry=zone.geometry,
+        zone_type=_enum_value(zone.zone_type) or "unknown",
+        location_type=_enum_value(zone.location_type),
+        is_accessible=cast(bool | None, zone.is_accessible),
+        pay=pay,
+        capacity=capacity,
+        current_occupied=target.current_occupied,
+        current_free_count=target.current_free_count,
+        current_confidence=target.current_confidence,
+        predicted_for_arrival=routed.arrival_time,
+        predicted_occupied=forecast_view.predicted_occupied,
+        predicted_free_count=forecast_view.predicted_free_count,
+        probability_free_space=forecast_view.probability_free_space,
+        forecast_confidence=forecast_view.forecast_confidence,
+        distance_from_origin_meters=routed.distance_from_origin_meters,
+        duration_from_origin_seconds=routed.duration_from_origin_seconds,
+        distance_to_destination_meters=routed.distance_to_destination_meters,
+        duration_to_destination_seconds=routed.duration_to_destination_seconds,
+        score=score,
+        rank=0,
+        ranking_explanation=explanation,
+    )
+
+    return _CandidateContext(
+        candidate=candidate,
+        tier=tier,
+        tier_label=tier_label,
+        effective_free_count=effective_free,
+        effective_confidence=effective_confidence,
+        availability_probability=probability,
+        availability_strength=availability_strength,
+        cluster_metrics=cluster,
+        base_cost_seconds=base_cost,
+        generalized_cost_seconds=generalized_cost,
+        price_penalty_seconds=price_penalty,
+        scarcity_penalty_seconds=scarcity_penalty,
+        confidence_penalty_seconds=confidence_penalty,
+        cluster_bonus_seconds=cluster_bonus,
+        availability_bonus_seconds=availability_bonus,
     )
 
 
-def _remove_unreasonable_detours(
-    candidates_with_meta: list[tuple[RouteCandidate, tuple[Any, ...], int]],
-    limit: int,
-    selected_zone_id: int | None,
-) -> list[tuple[RouteCandidate, tuple[Any, ...], int]]:
-    if selected_zone_id is not None:
-        return candidates_with_meta
+def _apply_peer_availability_penalties(contexts: list[_CandidateContext]) -> None:
+    for context in contexts:
+        candidate = context.candidate
+        penalty = 0.0
 
-    if not candidates_with_meta:
-        return []
+        for other in contexts:
+            if other is context:
+                continue
 
-    primary = [item for item in candidates_with_meta if item[2] <= 3]
+            other_candidate = other.candidate
 
-    if len(primary) < max(3, min(limit, 5)):
-        return candidates_with_meta
+            similar_drive_time = (
+                other_candidate.duration_from_origin_seconds
+                <= candidate.duration_from_origin_seconds + 5 * 60
+            )
 
-    best_duration = min(item[0].duration_from_origin_seconds for item in primary)
+            current_walk = candidate.duration_to_destination_seconds or 0
+            other_walk = other_candidate.duration_to_destination_seconds or 0
 
-    # Не показываем вариант на 5 часов, если есть сопоставимые варианты за час.
+            similar_walk = other_walk <= current_walk + 5 * 60
+            similar_price = other_candidate.pay <= candidate.pay + 100
+
+            much_better_availability = (
+                other.effective_free_count >= context.effective_free_count + 2
+                or other.availability_strength >= context.availability_strength + 0.20
+            )
+
+            not_weaker_cluster = (
+                other.cluster_metrics.cluster_strength
+                >= context.cluster_metrics.cluster_strength - 0.15
+            )
+
+            if (
+                similar_drive_time
+                and similar_walk
+                and similar_price
+                and much_better_availability
+                and not_weaker_cluster
+            ):
+                penalty = max(penalty, 900.0)
+
+        if penalty > 0:
+            context.peer_better_availability_penalty_seconds = penalty
+            context.generalized_cost_seconds += penalty
+
+
+def _apply_unreasonable_detour_penalties(contexts: list[_CandidateContext]) -> None:
+    good_contexts = [
+        context
+        for context in contexts
+        if context.tier <= 3
+    ]
+
+    if len(good_contexts) < 3:
+        return
+
+    best_duration = min(
+        context.candidate.duration_from_origin_seconds
+        for context in good_contexts
+    )
+
     max_reasonable_duration = max(
         best_duration + 30 * 60,
         int(best_duration * 2.5),
@@ -998,26 +1424,99 @@ def _remove_unreasonable_detours(
         best_duration + 2 * 60 * 60,
     )
 
-    reasonable: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
-    backup: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
+    for context in contexts:
+        if (
+            context.tier >= 3
+            and context.candidate.duration_from_origin_seconds > max_reasonable_duration
+        ):
+            context.unreasonable_detour_penalty_seconds = 3_600.0
+            context.generalized_cost_seconds += 3_600.0
 
-    for item in candidates_with_meta:
-        candidate = item[0]
-        tier = item[2]
 
-        if tier <= 3 and candidate.duration_from_origin_seconds <= max_reasonable_duration:
-            reasonable.append(item)
-        else:
-            backup.append(item)
+def _ranking_sort_key(context: _CandidateContext) -> tuple[Any, ...]:
+    candidate = context.candidate
 
-    if len(reasonable) >= limit:
-        return reasonable
+    poor_group = 1 if context.tier >= 5 else 0
 
-    return reasonable + backup
+    return (
+        poor_group,
+        context.generalized_cost_seconds,
+        -context.availability_strength,
+        -context.cluster_metrics.cluster_strength,
+        -context.effective_free_count,
+        candidate.pay,
+        candidate.duration_from_origin_seconds,
+        candidate.distance_from_origin_meters,
+        candidate.zone_id,
+    )
+
+
+def _finalize_contexts(contexts: list[_CandidateContext]) -> list[RouteCandidate]:
+    _apply_peer_availability_penalties(contexts)
+    _apply_unreasonable_detour_penalties(contexts)
+
+    finalized: list[_CandidateContext] = []
+
+    for context in contexts:
+        candidate = context.candidate
+        explanation = candidate.ranking_explanation
+
+        if explanation is not None:
+            reasons = _candidate_reasons(
+                tier_label=context.tier_label,
+                effective_free_count=context.effective_free_count,
+                current_free_count=candidate.current_free_count,
+                forecast_view=_ForecastView(
+                    predicted_occupied=candidate.predicted_occupied,
+                    predicted_free_count=candidate.predicted_free_count,
+                    probability_free_space=candidate.probability_free_space,
+                    forecast_confidence=candidate.forecast_confidence,
+                ),
+                probability_free_space=context.availability_probability,
+                duration_from_origin_seconds=candidate.duration_from_origin_seconds,
+                duration_to_destination_seconds=candidate.duration_to_destination_seconds,
+                pay=candidate.pay,
+                cluster_metrics=context.cluster_metrics,
+                peer_penalty=context.peer_better_availability_penalty_seconds,
+                detour_penalty=context.unreasonable_detour_penalty_seconds,
+            )
+
+            explanation = explanation.model_copy(
+                update={
+                    "generalized_cost_seconds": round(context.generalized_cost_seconds, 3),
+                    "peer_better_availability_penalty_seconds": round(
+                        context.peer_better_availability_penalty_seconds,
+                        3,
+                    ),
+                    "unreasonable_detour_penalty_seconds": round(
+                        context.unreasonable_detour_penalty_seconds,
+                        3,
+                    ),
+                    "reasons": reasons,
+                }
+            )
+
+        score = round(1.0 / (1.0 + context.generalized_cost_seconds / 1_800.0), 6)
+
+        context.candidate = candidate.model_copy(
+            update={
+                "score": score,
+                "ranking_explanation": explanation,
+            }
+        )
+
+        finalized.append(context)
+
+    finalized.sort(key=_ranking_sort_key)
+
+    return [
+        context.candidate.model_copy(update={"rank": rank})
+        for rank, context in enumerate(finalized, start=1)
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Основной поиск кандидатов
+# Route matrix
 # ---------------------------------------------------------------------------
 
 def _route_zone_pool(
@@ -1067,6 +1566,10 @@ def _route_zone_pool(
     return routed
 
 
+# ---------------------------------------------------------------------------
+# Основной поиск
+# ---------------------------------------------------------------------------
+
 def _search_candidates(
     db: Session,
     origin: GeoPoint,
@@ -1090,7 +1593,7 @@ def _search_candidates(
 
     anchor = destination if mode == "route_to_destination" and destination is not None else origin
 
-    cheap_pool = _query_zone_targets_near_anchor(
+    cluster_pool = _query_zone_targets_near_anchor(
         db=db,
         anchor=anchor,
         mode=mode,
@@ -1101,16 +1604,18 @@ def _search_candidates(
         selected_zone_id=selected_zone_id,
     )
 
+    matrix_targets = _select_matrix_targets(cluster_pool)
+
     routed_candidates = _route_zone_pool(
         origin=origin,
         destination=destination,
-        zone_targets=cheap_pool,
+        zone_targets=matrix_targets,
     )
 
     if not routed_candidates:
         return _CandidateSearchResult(candidates=[], total_candidates=0)
 
-    filtered_by_route: list[_RoutedCandidate] = []
+    filtered_by_explicit_constraints: list[_RoutedCandidate] = []
 
     for routed in routed_candidates:
         if (
@@ -1126,23 +1631,25 @@ def _search_candidates(
         ):
             continue
 
-        filtered_by_route.append(routed)
+        filtered_by_explicit_constraints.append(routed)
 
-    if not filtered_by_route:
+    if not filtered_by_explicit_constraints:
         return _CandidateSearchResult(candidates=[], total_candidates=0)
 
-    min_arrival = min(item.arrival_time for item in filtered_by_route)
-    max_arrival = max(item.arrival_time for item in filtered_by_route)
+    min_arrival = min(item.arrival_time for item in filtered_by_explicit_constraints)
+    max_arrival = max(item.arrival_time for item in filtered_by_explicit_constraints)
 
-    zone_ids = [
-        int(item.zone_target.zone.parking_zone_id)
-        for item in filtered_by_route
-    ]
+    forecast_zone_ids = sorted(
+        {
+            int(target.zone.parking_zone_id)
+            for target in cluster_pool
+        }
+    )
 
     forecasts_by_zone = (
-        _load_forecasts_for_candidates(
+        _load_forecasts_for_zones(
             db=db,
-            zone_ids=zone_ids,
+            zone_ids=forecast_zone_ids,
             min_arrival=min_arrival,
             max_arrival=max_arrival,
         )
@@ -1150,126 +1657,32 @@ def _search_candidates(
         else {}
     )
 
-    candidates_with_meta: list[tuple[RouteCandidate, tuple[Any, ...], int]] = []
+    contexts: list[_CandidateContext] = []
 
-    for routed in filtered_by_route:
-        target = routed.zone_target
-        zone = target.zone
-
-        capacity = max(int(zone.capacity or 0), 0)
-        pay = max(int(zone.pay or 0), 0)
-
-        forecast = None
-
-        if use_forecast:
-            forecast = _pick_forecast_for_arrival(
-                forecasts_by_zone.get(int(zone.parking_zone_id), []),
-                routed.arrival_time,
-            )
-
-        forecast_view = _forecast_view(
-            zone_capacity=capacity,
-            forecast=forecast,
-        )
-
-        effective_free_count = _effective_free_count(
-            current_free_count=target.current_free_count,
-            forecast_view=forecast_view,
+    for routed in filtered_by_explicit_constraints:
+        context = _build_ranking_context(
+            routed=routed,
+            cluster_pool=cluster_pool,
+            forecasts_by_zone=forecasts_by_zone,
             use_forecast=use_forecast,
         )
 
-        effective_confidence = _effective_confidence(
-            current_confidence=target.current_confidence,
-            forecast_view=forecast_view,
-            use_forecast=use_forecast,
-        )
-
-        probability_free_space = _availability_probability(
-            effective_free_count=effective_free_count,
-            forecast_view=forecast_view,
-            use_forecast=use_forecast,
-        )
-
-        # Явные пользовательские ограничения — жёсткие.
-        if min_free_count is not None and effective_free_count < min_free_count:
+        if min_free_count is not None and context.effective_free_count < min_free_count:
             continue
 
-        if min_confidence is not None and effective_confidence < min_confidence:
+        if min_confidence is not None and context.effective_confidence < min_confidence:
             continue
 
-        tier = _candidate_tier(
-            current_free_count=target.current_free_count,
-            effective_free_count=effective_free_count,
-            probability_free_space=probability_free_space,
-            effective_confidence=effective_confidence,
-            duration_from_origin_seconds=routed.duration_from_origin_seconds,
-            requested_min_free_count=min_free_count,
-            use_forecast=use_forecast,
-            forecast_view=forecast_view,
-        )
+        contexts.append(context)
 
-        score = _display_score(
-            tier=tier,
-            effective_free_count=effective_free_count,
-            probability_free_space=probability_free_space,
-            effective_confidence=effective_confidence,
-            duration_from_origin_seconds=routed.duration_from_origin_seconds,
-            duration_to_destination_seconds=routed.duration_to_destination_seconds,
-            pay=pay,
-        )
+    if not contexts:
+        return _CandidateSearchResult(candidates=[], total_candidates=0)
 
-        candidate = RouteCandidate(
-            zone_id=int(zone.parking_zone_id),
-            camera_id=cast(int | None, zone.camera_id),
-            geometry=zone.geometry,
-            zone_type=_enum_value(zone.zone_type) or "unknown",
-            location_type=_enum_value(zone.location_type),
-            is_accessible=cast(bool | None, zone.is_accessible),
-            pay=pay,
-            capacity=capacity,
-            current_occupied=target.current_occupied,
-            current_free_count=target.current_free_count,
-            current_confidence=target.current_confidence,
-            predicted_for_arrival=routed.arrival_time,
-            predicted_occupied=forecast_view.predicted_occupied,
-            predicted_free_count=forecast_view.predicted_free_count,
-            probability_free_space=forecast_view.probability_free_space,
-            forecast_confidence=forecast_view.forecast_confidence,
-            distance_from_origin_meters=routed.distance_from_origin_meters,
-            duration_from_origin_seconds=routed.duration_from_origin_seconds,
-            distance_to_destination_meters=routed.distance_to_destination_meters,
-            duration_to_destination_seconds=routed.duration_to_destination_seconds,
-            score=score,
-            rank=0,
-        )
-
-        ranking_key = _ranking_key(
-            candidate=candidate,
-            tier=tier,
-            effective_free_count=effective_free_count,
-            probability_free_space=probability_free_space,
-            effective_confidence=effective_confidence,
-        )
-
-        candidates_with_meta.append((candidate, ranking_key, tier))
-
-    candidates_with_meta.sort(key=lambda item: item[1])
-
-    candidates_with_meta = _remove_unreasonable_detours(
-        candidates_with_meta=candidates_with_meta,
-        limit=limit,
-        selected_zone_id=selected_zone_id,
-    )
-
-    total_candidates = len(candidates_with_meta)
-
-    ranked = [
-        item[0].model_copy(update={"rank": rank})
-        for rank, item in enumerate(candidates_with_meta, start=1)
-    ]
+    ranked_candidates = _finalize_contexts(contexts)
+    total_candidates = len(ranked_candidates)
 
     return _CandidateSearchResult(
-        candidates=ranked[:limit],
+        candidates=ranked_candidates[:limit],
         total_candidates=total_candidates,
     )
 
@@ -1308,7 +1721,7 @@ def _selected_candidate_or_422(
 
 
 # ---------------------------------------------------------------------------
-# POST /routing/search — публичный поиск без авторизации
+# POST /routing/search — публичный
 # ---------------------------------------------------------------------------
 
 @router.post("/search", response_model=SearchRoutingResponse)
@@ -1347,7 +1760,7 @@ def search_routing(
 
 
 # ---------------------------------------------------------------------------
-# POST /routing/new — публичное построение и сохранение маршрута
+# POST /routing/new — публичный
 # ---------------------------------------------------------------------------
 
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
@@ -1403,13 +1816,13 @@ def create_route(
         .one_or_none()
     )
 
-    zone_point = body.origin
+    deeplink_target = body.origin
 
     if selected_zone is not None:
-        centroid = _zone_point(selected_zone)
+        centroid = _zone_point_from_centroid_columns(selected_zone)
 
         if centroid is not None:
-            zone_point = centroid
+            deeplink_target = centroid
 
     route = Route(
         user_id=public_user_id,
@@ -1424,7 +1837,7 @@ def create_route(
         eta_seconds=best.duration_from_origin_seconds,
         arrival_time=best.predicted_for_arrival,
         polyline=None,
-        deeplink_url=_build_map_deeplink(zone_point),
+        deeplink_url=_build_map_deeplink(deeplink_target),
         status=RouteStatus.active,
         created_at=now,
         updated_at=now,
@@ -1448,7 +1861,7 @@ def create_route(
 
 
 # ---------------------------------------------------------------------------
-# GET /routing — маршруты текущего пользователя
+# GET /routing
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=RouteListResponse)
@@ -1575,7 +1988,7 @@ def update_route(
         except RoutingProviderError as exc:
             raise _provider_unavailable(exc) from exc
 
-        centroid = _zone_point(zone)
+        centroid = _zone_point_from_centroid_columns(zone)
 
         route.provider = GEOAPIFY_PROVIDER_NAME
         route.selected_zone_id = body.selected_zone_id

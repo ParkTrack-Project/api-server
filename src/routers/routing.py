@@ -8,7 +8,7 @@ from typing import Annotated, Any, cast
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,41 @@ GEOAPIFY_MODE = "drive"
 # Чтобы случайно не отправлять в Geoapify слишком большую матрицу.
 # Сначала зоны грубо сортируются по прямому расстоянию, потом лучшие идут в API.
 MAX_MATRIX_TARGETS = 200
+
+PUBLIC_ROUTING_USER_EMAIL = "public-routing@parktrack.local"
+
+
+def _get_public_routing_user_id(db: Session) -> int:
+    """
+    /routing/new теперь публичный, но routes.user_id в БД NOT NULL.
+    Поэтому сохраняем публичные маршруты на технического пользователя.
+    """
+    result = db.execute(
+        text(
+            """
+            INSERT INTO users (
+                full_name,
+                email,
+                hashed_password,
+                global_role,
+                is_active
+            )
+            VALUES (
+                'Public Routing User',
+                :email,
+                'disabled-public-routing-user',
+                CAST('user' AS global_roles),
+                TRUE
+            )
+            ON CONFLICT (email)
+            DO UPDATE SET email = EXCLUDED.email
+            RETURNING user_id
+            """
+        ),
+        {"email": PUBLIC_ROUTING_USER_EMAIL},
+    )
+
+    return int(result.scalar_one())
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +682,6 @@ def _selected_candidate_or_422(
 @router.post("/search", response_model=SearchRoutingResponse)
 def search_routing(
     body: SearchRoutingRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
     try:
@@ -687,7 +721,6 @@ def search_routing(
 @router.post("/new", status_code=status.HTTP_201_CREATED, response_model=RouteResponse)
 def create_route(
     body: CreateRouteRequest,
-    current_user: Annotated[User, require("routing.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
     if body.selected_zone_id is not None:
@@ -730,9 +763,10 @@ def create_route(
 
     best = result.candidates[0]
     now = datetime.now(timezone.utc)
+    public_user_id = _get_public_routing_user_id(db)
 
     route = Route(
-        user_id=current_user.user_id,
+        user_id=public_user_id,
         mode=RouteMode(body.mode),
         provider=GEOAPIFY_PROVIDER_NAME,
         origin_latitude=body.origin.latitude,

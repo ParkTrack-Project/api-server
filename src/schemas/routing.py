@@ -5,7 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-RoutingProvider = Literal["yandex", "internal", "external"]
+
+RoutingProvider = Literal["geoapify", "external", "yandex", "internal"]
 
 
 # ---------------------------------------------------------------------------
@@ -13,7 +14,7 @@ RoutingProvider = Literal["yandex", "internal", "external"]
 # ---------------------------------------------------------------------------
 
 class GeoPoint(BaseModel):
-    latitude:  float = Field(ge=-90,  le=90)
+    latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
 
 
@@ -22,76 +23,79 @@ class GeoPoint(BaseModel):
 # ---------------------------------------------------------------------------
 
 class RouteCandidate(BaseModel):
-    zone_id:                        int
-    camera_id:                      int | None
-    geometry:                       Any           # GeoJSON Polygon
-    zone_type:                      str
-    location_type:                  str | None
-    is_accessible:                  bool | None
-    pay:                            int
-    capacity:                       int
-    current_occupied:               int
-    current_free_count:             int
-    current_confidence:             float
-    predicted_for_arrival:          datetime
-    predicted_occupied:             int   | None
-    predicted_free_count:           int   | None
-    probability_free_space:         float | None
-    forecast_confidence:            float | None
-    distance_from_origin_meters:    int
-    duration_from_origin_seconds:   int
-    distance_to_destination_meters:  int | None
+    zone_id: int
+    camera_id: int | None
+    geometry: Any
+    zone_type: str
+    location_type: str | None
+    is_accessible: bool | None
+    pay: int
+    capacity: int
+    current_occupied: int
+    current_free_count: int
+    current_confidence: float
+    predicted_for_arrival: datetime
+    predicted_occupied: int | None
+    predicted_free_count: int | None
+    probability_free_space: float | None
+    forecast_confidence: float | None
+    distance_from_origin_meters: int
+    duration_from_origin_seconds: int
+    distance_to_destination_meters: int | None
     duration_to_destination_seconds: int | None
-    score:                          float
-    rank:                           int
+    score: float
+    rank: int
 
 
 # ---------------------------------------------------------------------------
-# Route (полная модель)
+# Route
 # ---------------------------------------------------------------------------
 
 class RouteResponse(BaseModel):
-    route_id:           int
-    user_id:            int
-    mode:               str
-    provider:           str
-    origin:             GeoPoint
-    destination:        GeoPoint | None
-    selected_zone_id:   int | None
+    route_id: int
+    user_id: int
+    mode: str
+    provider: str
+    origin: GeoPoint
+    destination: GeoPoint | None
+    selected_zone_id: int | None
     selected_candidate: RouteCandidate | None
-    eta_seconds:        int | None
-    arrival_time:       datetime | None
-    polyline:           str | None
-    deeplink_url:       str | None
-    status:             str
-    created_at:         datetime
-    updated_at:         datetime
+    eta_seconds: int | None
+    arrival_time: datetime | None
+    polyline: str | None
+    deeplink_url: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class RouteListResponse(BaseModel):
-    items:  list[RouteResponse]
-    total:  int
-    top:    int
+    items: list[RouteResponse]
+    total: int
+    top: int
     offset: int
 
 
 # ---------------------------------------------------------------------------
-# Запросы — общая база для search и new
+# Запросы
 # ---------------------------------------------------------------------------
 
 class RoutingRequestBase(BaseModel):
-    mode:                               Literal["find_parking", "route_to_destination"]
-    origin:                             GeoPoint
-    destination:                        GeoPoint | None = None
-    max_pay:                            int   | None = Field(None, ge=0)
-    min_free_count:                     int   | None = Field(None, ge=0)
-    min_confidence:                     float | None = Field(None, ge=0.0, le=1.0)
-    max_distance_to_destination_meters: int   | None = Field(None, ge=0)
-    max_duration_from_origin_seconds:   int   | None = Field(None, ge=0)
-    include_accessible:                 bool  | None = None
-    limit:                              int          = Field(10, ge=1, le=50)
-    use_forecast:                       bool         = False
-    provider:                           RoutingProvider = "yandex"
+    mode: Literal["find_parking", "route_to_destination"]
+    origin: GeoPoint
+    destination: GeoPoint | None = None
+    max_pay: int | None = Field(None, ge=0)
+    min_free_count: int | None = Field(None, ge=0)
+    min_confidence: float | None = Field(None, ge=0.0, le=1.0)
+    max_distance_to_destination_meters: int | None = Field(None, ge=0)
+    max_duration_from_origin_seconds: int | None = Field(None, ge=0)
+    include_accessible: bool | None = None
+    limit: int = Field(10, ge=1, le=50)
+    use_forecast: bool = False
+
+    # Оставляем provider для совместимости с ТЗ/фронтом,
+    # но фактически маршрутизация ниже всегда идёт через Geoapify.
+    provider: RoutingProvider = "geoapify"
 
     @model_validator(mode="after")
     def destination_required_for_route_mode(self) -> "RoutingRequestBase":
@@ -108,24 +112,16 @@ class CreateRouteRequest(RoutingRequestBase):
     selected_zone_id: int | None = None
 
 
-# ---------------------------------------------------------------------------
-# Ответ /routing/search
-# ---------------------------------------------------------------------------
-
 class SearchRoutingResponse(BaseModel):
-    mode:             str
-    provider:         str
-    generated_at:     datetime
+    mode: str
+    provider: str
+    generated_at: datetime
     selected_zone_id: int | None
     total_candidates: int
-    candidates:       list[RouteCandidate]
+    candidates: list[RouteCandidate]
 
-
-# ---------------------------------------------------------------------------
-# Обновление маршрута
-# ---------------------------------------------------------------------------
 
 class UpdateRouteRequest(BaseModel):
-    status:          Literal["active", "completed", "cancelled", "replaced"] | None = None
-    selected_zone_id: int  | None = None
-    provider:        RoutingProvider | None = None
+    status: Literal["active", "completed", "cancelled", "replaced"] | None = None
+    selected_zone_id: int | None = None
+    provider: RoutingProvider | None = None

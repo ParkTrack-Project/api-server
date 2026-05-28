@@ -79,6 +79,7 @@ def _serialize_map(z: ParkingZone, db: Session) -> ZoneMapItemResponse:
 def _saturate_occupied_zone(zone: ParkingZone) -> None:
     if zone.occupied > zone.capacity:
         zone.occupied = zone.capacity
+        zone.free_count = 0
 
 def _get_zone_or_404(db: Session, zone_id: int) -> ParkingZone:
     zone = db.query(ParkingZone).filter(ParkingZone.parking_zone_id == zone_id).one_or_none()

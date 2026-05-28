@@ -76,12 +76,17 @@ def _serialize_map(z: ParkingZone, db: Session) -> ZoneMapItemResponse:
         is_active=z.is_active,
     )
 
+def _saturate_occupied_zone(zone: ParkingZone) -> None:
+    if zone.occupied > zone.capacity:
+        zone.occupied = zone.capacity
 
 def _get_zone_or_404(db: Session, zone_id: int) -> ParkingZone:
     zone = db.query(ParkingZone).filter(ParkingZone.parking_zone_id == zone_id).one_or_none()
     if zone is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail={"error_description": "Zone not found"})
+    
+    _saturate_occupied_zone(zone)
     return zone
 
 

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated
-
+from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, ParkingZone, Partner, User
+from ..db_models import Camera, LocationType, ParkingZone, Partner, User, ZoneType
 from ..dependencies import get_effective_permissions, require, resolve_current_user
 from ..schemas.zones import (
     CreateZoneRequest,
@@ -138,6 +138,107 @@ def list_zones(
     return [_serialize(z, db) for z in zones]
 
 
+def _to_int(value: Any, default: int, min_value: int | None = None) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            result = default
+        else:
+            result = int(float(value))
+    except (TypeError, ValueError):
+        result = default
+
+    if min_value is not None:
+        result = max(result, min_value)
+
+    return result
+
+
+def _to_bool(value: Any, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    if isinstance(value, int):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in {"true", "1", "yes", "y", "да"}:
+            return True
+
+        if normalized in {"false", "0", "no", "n", "нет"}:
+            return False
+
+    return default
+
+
+def _normalize_zone_type(value: Any) -> ZoneType:
+    if isinstance(value, ZoneType):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized == "parallel":
+            return ZoneType.parallel
+
+        if normalized == "standard":
+            return ZoneType.standard
+
+    return ZoneType.standard
+
+
+def _normalize_location_type(value: Any) -> LocationType | None:
+    if isinstance(value, LocationType):
+        return value
+
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().lower()
+
+    try:
+        return LocationType(normalized)
+    except ValueError:
+        return None
+
+
+def _json_or_default(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+
+    return value
+
+
+def _get_camera_for_zone(db: Session, raw_camera_id: Any) -> Camera | None:
+    camera_id = _to_int(raw_camera_id, default=0, min_value=1)
+
+    camera = db.query(Camera).filter(Camera.camera_id == camera_id).one_or_none()
+
+    if camera is not None:
+        return camera
+
+    # Неубиваемый режим: если camera_id плохой или камеры нет,
+    # привязываем зону к первой существующей камере.
+    return db.query(Camera).order_by(Camera.camera_id.asc()).first()
+
+
+def _get_partner_id_or_none(db: Session, raw_partner_id: Any) -> int | None:
+    if raw_partner_id is None:
+        return None
+
+    partner_id = _to_int(raw_partner_id, default=0, min_value=1)
+
+    partner = db.query(Partner).filter(Partner.partner_id == partner_id).one_or_none()
+
+    if partner is None:
+        return None
+
+    return partner.partner_id
+
 # ---------------------------------------------------------------------------
 # POST /zones/new
 # ---------------------------------------------------------------------------
@@ -148,33 +249,66 @@ def create_zone(
     current_user: Annotated[User, require("zones.create")],
     db: Annotated[Session, Depends(get_db)],
 ):
-    if not db.query(Camera).filter(Camera.camera_id == body.camera_id).one_or_none():
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail={"error_description": f"Camera {body.camera_id} not found"})
+    camera = _get_camera_for_zone(db, body.camera_id)
 
-    if body.partner_id is not None:
-        if not db.query(Partner).filter(Partner.partner_id == body.partner_id).one_or_none():
-            raise HTTPException(status.HTTP_404_NOT_FOUND,
-                                detail={"error_description": "Partner not found"})
+    if camera is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error_description": "Cannot create parking zone: no cameras exist"
+            },
+        )
+
+    capacity = _to_int(body.capacity, default=0, min_value=0)
+    pay = _to_int(body.pay, default=0, min_value=0)
+
+    geometry = _json_or_default(
+        body.geometry,
+        {
+            "type": "Polygon",
+            "coordinates": [[]],
+        },
+    )
+
+    image_polygon = _json_or_default(
+        body.image_polygon,
+        [],
+    )
 
     zone = ParkingZone(
-        camera_id=body.camera_id,
-        zone_type=body.zone_type,
-        capacity=body.capacity,
+        camera_id=camera.camera_id,
+        zone_type=_normalize_zone_type(body.zone_type),
+        capacity=capacity,
         occupied=0,
-        pay=body.pay,
-        geometry=body.geometry,
-        image_polygon=body.image_polygon,
-        partner_id=body.partner_id,
+        confidence=0.0,
+        confidence_level=None,
+        pay=pay,
+        geometry=geometry,
+        image_polygon=image_polygon,
+        partner_id=_get_partner_id_or_none(db, body.partner_id),
         created_by_user_id=current_user.user_id,
-        is_active=True,
-        location_type=body.location_type,
-        is_private=body.is_private,
-        is_accessible=body.is_accessible,
+        is_active=_to_bool(body.is_active, default=True),
+        location_type=_normalize_location_type(body.location_type),
+        is_private=_to_bool(body.is_private, default=None),
+        is_accessible=_to_bool(body.is_accessible, default=None),
     )
+
     db.add(zone)
-    db.commit()
-    db.refresh(zone)
+
+    try:
+        db.commit()
+        db.refresh(zone)
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Parking zone payload could not be saved after normalization",
+                "details": str(exc.__class__.__name__),
+            },
+        )
+
     return {"zone_id": zone.parking_zone_id}
 
 

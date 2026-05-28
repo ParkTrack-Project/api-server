@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ast
+import json
 from datetime import datetime, timezone
-from typing import Annotated, Union, cast
+from typing import Annotated, Any, Union, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text, func
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -43,7 +47,43 @@ def _confidence_level(confidence: float) -> ConfidenceLevel | None:
     else:
         return ConfidenceLevel.very_low
 
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value
 
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _is_newer_or_same_observation(
+    incoming_observed_at: datetime,
+    current_zone_updated_at: datetime | None,
+) -> bool:
+    if current_zone_updated_at is None:
+        return True
+
+    return _to_utc_naive(incoming_observed_at) >= _to_utc_naive(current_zone_updated_at)
+
+
+def _clamp_int(value: int, min_value: int, max_value: int | None = None) -> int:
+    value = max(value, min_value)
+
+    if max_value is not None:
+        value = min(value, max_value)
+
+    return value
+
+
+def _clamp_float(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(value, max_value))
+
+
+def _confidence_level_value(confidence: float) -> str:
+    level = _confidence_level(confidence)
+
+    if level is None:
+        return "very_low"
+
+    return level.value
 def _serialize_obs(obs: OccupancyObservation, db: Session) -> OccupancyObservationResponse:
     return OccupancyObservationResponse(
         observation_id=obs.observation_id,
@@ -244,16 +284,56 @@ def list_occupancy(
     return [_serialize_obs(obs, db) for obs in observations]
 
 
+async def _parse_lenient_body(request: Request) -> dict[str, Any]:
+    raw = await request.body()
+
+    if not raw:
+        return {}
+
+    text = raw.decode("utf-8", errors="replace").strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error_description": "Request body must be JSON or Python-like dict"},
+            )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_description": "Request body must be an object"},
+        )
+
+    return data
+
 # ---------------------------------------------------------------------------
 # POST /occupancy/new
 # ---------------------------------------------------------------------------
 
 @router.post("/new", status_code=status.HTTP_201_CREATED)
-def create_observation(
-    body:         CreateOccupancyRequest,
+async def create_observation(
+    request:      Request,
     current_user: Annotated[User, require("occupancy.write")],
     db:           Annotated[Session, Depends(get_db)],
 ):
+    raw_body = await _parse_lenient_body(request)
+
+    try:
+        body = CreateOccupancyRequest.model_validate(raw_body)
+    except ValidationError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Invalid occupancy payload",
+                "errors": exc.errors(),
+            },
+        )
+
     zone = db.query(ParkingZone).filter(
         ParkingZone.parking_zone_id == body.zone_id
     ).one_or_none()
@@ -264,74 +344,146 @@ def create_observation(
             detail={"error_description": "Zone not found"},
         )
 
-    zone_camera_id = cast(int, zone.camera_id)
+    zone_id = body.zone_id
+    zone_camera_id = cast(int | None, zone.camera_id)
     zone_partner_id = cast(int | None, zone.partner_id)
+    zone_capacity = cast(int, zone.capacity)
     zone_occupancy_updated_at = cast(datetime | None, zone.occupancy_updated_at)
     current_user_id = cast(int | None, current_user.user_id)
 
-    capacity = body.capacity if body.capacity is not None else zone.capacity
+    capacity = body.capacity if body.capacity is not None else zone_capacity
+    capacity = _clamp_int(capacity, min_value=0)
 
-    if body.occupied > capacity:
-        body.occupied = capacity
+    occupied = _clamp_int(body.occupied, min_value=0, max_value=capacity)
+    confidence = _clamp_float(body.confidence, min_value=0.0, max_value=1.0)
+    confidence_level = _confidence_level_value(confidence)
 
-    cl = _confidence_level(body.confidence)
     now = datetime.now(timezone.utc)
 
-    # Если источник прислал стабильный source_ref, то повторный запрос
-    # должен обновлять существующее наблюдение, а не падать с 409.
-    obs: OccupancyObservation | None = None
-
-    if body.source_ref:
-        obs = db.query(OccupancyObservation).filter(
-            OccupancyObservation.source_type == body.source_type,
-            OccupancyObservation.source_ref == body.source_ref,
-        ).one_or_none()
-
-    # Если source_ref нет, считаем это новым наблюдением.
-    if obs is None:
-        obs = OccupancyObservation(
-            zone_id=body.zone_id,
-            camera_id=zone_camera_id,
-            partner_id=zone_partner_id,
-            source_type=body.source_type,
-            source_ref=body.source_ref,
-            capacity=capacity,
-            occupied=body.occupied,
-            confidence=body.confidence,
-            confidence_level=cl,
-            observed_at=body.observed_at,
-            ingested_at=now,
-            metadata_json=body.metadata,
-            created_by_user_id=current_user_id,
+    try:
+        result = db.execute(
+            text(
+                """
+                INSERT INTO occupancy_observations (
+                    zone_id,
+                    camera_id,
+                    partner_id,
+                    source_type,
+                    source_ref,
+                    capacity,
+                    occupied,
+                    confidence,
+                    confidence_level,
+                    observed_at,
+                    ingested_at,
+                    metadata,
+                    created_by_user_id
+                )
+                VALUES (
+                    :zone_id,
+                    :camera_id,
+                    :partner_id,
+                    :source_type,
+                    :source_ref,
+                    :capacity,
+                    :occupied,
+                    :confidence,
+                    :confidence_level,
+                    :observed_at,
+                    :ingested_at,
+                    CAST(:metadata AS jsonb),
+                    :created_by_user_id
+                )
+                ON CONFLICT (source_type, source_ref)
+                DO UPDATE SET
+                    zone_id = EXCLUDED.zone_id,
+                    camera_id = EXCLUDED.camera_id,
+                    partner_id = EXCLUDED.partner_id,
+                    capacity = EXCLUDED.capacity,
+                    occupied = EXCLUDED.occupied,
+                    confidence = EXCLUDED.confidence,
+                    confidence_level = EXCLUDED.confidence_level,
+                    observed_at = EXCLUDED.observed_at,
+                    ingested_at = EXCLUDED.ingested_at,
+                    metadata = EXCLUDED.metadata,
+                    created_by_user_id = COALESCE(
+                        occupancy_observations.created_by_user_id,
+                        EXCLUDED.created_by_user_id
+                    )
+                RETURNING observation_id
+                """
+            ),
+            {
+                "zone_id": zone_id,
+                "camera_id": zone_camera_id,
+                "partner_id": zone_partner_id,
+                "source_type": body.source_type,
+                "source_ref": body.source_ref,
+                "capacity": capacity,
+                "occupied": occupied,
+                "confidence": confidence,
+                "confidence_level": confidence_level,
+                "observed_at": body.observed_at,
+                "ingested_at": now,
+                "metadata": json.dumps(body.metadata),
+                "created_by_user_id": current_user_id,
+            },
         )
-        db.add(obs)
-    else:
-        obs.zone_id = body.zone_id
-        obs.camera_id = zone_camera_id
-        obs.partner_id = zone_partner_id
-        obs.capacity = capacity
-        obs.occupied = body.occupied
-        obs.confidence = body.confidence
-        obs.confidence_level = cl
-        obs.observed_at = body.observed_at
-        obs.ingested_at = now
-        obs.metadata_json = body.metadata
 
-        if obs.created_by_user_id is None:
-            obs.created_by_user_id = current_user.user_id
+        observation_id = result.scalar_one()
 
-    # Обновляем денормализованные поля parking_zones только если пришло
-    # самое свежее наблюдение или наблюдение с тем же временем.
-    if zone_occupancy_updated_at is None or body.observed_at >= zone_occupancy_updated_at:
-        zone.occupied = body.occupied
-        zone.confidence = body.confidence
-        zone.confidence_level = cl
-        zone.occupancy_updated_at = body.observed_at
+        if _is_newer_or_same_observation(body.observed_at, zone_occupancy_updated_at):
+            db.execute(
+                text(
+                    """
+                    UPDATE parking_zones
+                    SET
+                        occupied = :occupied,
+                        confidence = :confidence,
+                        confidence_level = CAST(:confidence_level AS confidence_level_types),
+                        occupancy_updated_at = :occupancy_updated_at,
+                        updated_at = NOW()
+                    WHERE parking_zone_id = :zone_id
+                    """
+                ),
+                {
+                    "zone_id": zone_id,
+                    "occupied": occupied,
+                    "confidence": confidence,
+                    "confidence_level": confidence_level,
+                    "occupancy_updated_at": _to_utc_naive(body.observed_at),
+                },
+            )
 
-    db.commit()
-    db.refresh(obs)
+        db.commit()
 
-    return {"observation_id": obs.observation_id}
+    except IntegrityError as exc:
+        db.rollback()
+        orig = getattr(exc, "orig", None)
+        diag = getattr(orig, "diag", None)
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Occupancy payload could not be saved",
+                "error_type": "IntegrityError",
+                "pg_error": str(orig),
+                "constraint": getattr(diag, "constraint_name", None),
+                "table": getattr(diag, "table_name", None),
+                "column": getattr(diag, "column_name", None),
+            },
+        )
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_description": "Occupancy payload could not be saved",
+                "error_type": exc.__class__.__name__,
+            },
+        )
+
+    return {"observation_id": observation_id}
 
 
 # ---------------------------------------------------------------------------

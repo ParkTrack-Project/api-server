@@ -110,6 +110,10 @@ BASE_ADMIN_PERMISSIONS: frozenset[str] = frozenset({
     "admin.system.manage",
     "admin.monitoring.view",
     "admin.analytics.view",
+    "admin.forecasts.view",
+    "analytics.view",
+    "analytics.feedback.create",
+    "analytics.feedback.view",
     "cameras.view",
     "cameras.create",
     "cameras.update",
@@ -141,6 +145,8 @@ PARTNER_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
         "partner_members.update",
         "partner_members.disable",
         "partner_access.manage",
+        "analytics.view",
+        "analytics.feedback.create",
     }),
     "partner_admin": frozenset({
         "sources.view",
@@ -157,6 +163,8 @@ PARTNER_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
         "partner_members.update",
         "partner_members.disable",
         "partner_access.manage",
+        "analytics.view",
+        "analytics.feedback.create",
     }),
     "partner_manager": frozenset({
         "sources.view",
@@ -167,16 +175,21 @@ PARTNER_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
         "zones.create",
         "zones.update",
         "partner_members.view",
+        "analytics.view",
+        "analytics.feedback.create",
     }),
     "partner_analyst": frozenset({
         "sources.view",
         "cameras.view",
         "zones.view",
+        "analytics.view",
+        "analytics.feedback.create",
     }),
     "partner_viewer": frozenset({
         "sources.view",
         "cameras.view",
         "zones.view",
+        "analytics.view",
     }),
 }
 

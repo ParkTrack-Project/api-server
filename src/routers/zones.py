@@ -35,7 +35,7 @@ def _serialize(z: ParkingZone, db: Session) -> ZoneResponse:
         zone_type=z.zone_type.value,
         capacity=z.capacity,
         occupied=z.occupied,
-        free_count=free_count,
+        free_count=free_count if free_count >= 0 else 0,
         confidence=z.confidence or 0.0,
         confidence_level=z.confidence_level.value if z.confidence_level else None,
         pay=z.pay,
@@ -64,7 +64,7 @@ def _serialize_map(z: ParkingZone, db: Session) -> ZoneMapItemResponse:
         zone_type=z.zone_type.value,
         capacity=z.capacity,
         occupied=z.occupied,
-        free_count=free_count,
+        free_count=free_count if free_count >= 0 else 0,
         confidence=z.confidence or 0.0,
         confidence_level=z.confidence_level.value if z.confidence_level else None,
         pay=z.pay,
@@ -76,18 +76,11 @@ def _serialize_map(z: ParkingZone, db: Session) -> ZoneMapItemResponse:
         is_active=z.is_active,
     )
 
-def _saturate_occupied_zone(zone: ParkingZone) -> None:
-    if zone.occupied > zone.capacity:
-        zone.occupied = zone.capacity
-        zone.free_count = 0
-
 def _get_zone_or_404(db: Session, zone_id: int) -> ParkingZone:
     zone = db.query(ParkingZone).filter(ParkingZone.parking_zone_id == zone_id).one_or_none()
     if zone is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             detail={"error_description": "Zone not found"})
-    
-    _saturate_occupied_zone(zone)
     return zone
 
 

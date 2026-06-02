@@ -327,6 +327,64 @@ class OccupancyObservation(Base):
 
 
 # ---------------------------------------------------------------------------
+# Detection Feedback
+# ---------------------------------------------------------------------------
+
+class DetectionFeedback(Base):
+    __tablename__ = "detection_feedback"
+
+    feedback_id             = Column(Integer, primary_key=True, autoincrement=True)
+    detection_run_id        = Column(
+        Integer,
+        ForeignKey("occupancy_observations.observation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_by_user_id      = Column(Integer, ForeignKey("users.user_id", ondelete="SET NULL"), nullable=True)
+    rating                  = Column(String(32), nullable=False)
+    expected_occupied_count = Column(Integer, nullable=True)
+    expected_free_count     = Column(Integer, nullable=True)
+    error_type              = Column(String(64), nullable=True)
+    comment                 = Column(Text, nullable=True)
+    created_at              = Column(DateTime(timezone=True), default=_now)
+    updated_at              = Column(DateTime(timezone=True), nullable=True)
+
+    detection_run = relationship("OccupancyObservation", foreign_keys=[detection_run_id])
+    created_by    = relationship("User", foreign_keys=[created_by_user_id])
+
+    __table_args__ = (
+        CheckConstraint(
+            "rating IN ('correct', 'partially_correct', 'incorrect')",
+            name="ck_detection_feedback_rating",
+        ),
+        CheckConstraint(
+            "expected_occupied_count IS NULL OR expected_occupied_count >= 0",
+            name="ck_detection_feedback_expected_occupied_non_negative",
+        ),
+        CheckConstraint(
+            "expected_free_count IS NULL OR expected_free_count >= 0",
+            name="ck_detection_feedback_expected_free_non_negative",
+        ),
+        CheckConstraint(
+            """
+            error_type IS NULL OR error_type IN (
+                'false_positive_car',
+                'false_negative_car',
+                'wrong_zone_assignment',
+                'bad_lighting',
+                'bad_camera_angle',
+                'calibration_problem',
+                'other'
+            )
+            """,
+            name="ck_detection_feedback_error_type",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DetectionFeedback id={self.feedback_id} run_id={self.detection_run_id}>"
+
+
+# ---------------------------------------------------------------------------
 # Forecasts
 # ---------------------------------------------------------------------------
 

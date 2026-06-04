@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import auth, users, partners, cameras, zones, admin, sources, occupancy, forecasts, routing, weather
+from .routers import auth, users, partners, cameras, zones, admin, analytics, sources, occupancy, forecasts, routing, weather
 from .database import engine
 from .db_models import Base
 
@@ -50,6 +50,7 @@ app.include_router(partners.router, prefix=PREFIX)
 app.include_router(cameras.router,  prefix=PREFIX)
 app.include_router(zones.router,    prefix=PREFIX)
 app.include_router(admin.router,    prefix=PREFIX)
+app.include_router(analytics.router,prefix=PREFIX)
 app.include_router(sources.router,  prefix=PREFIX)
 app.include_router(occupancy.router,prefix=PREFIX)
 app.include_router(forecasts.router,prefix=PREFIX)

@@ -77,13 +77,6 @@ class UpdateZoneRequest(BaseModel):
     is_accessible: bool | None = None
     is_active:     bool | None = None
 
-    @model_validator(mode="after")
-    def occupied_lte_capacity(self) -> "UpdateZoneRequest":
-        if self.occupied is not None and self.capacity is not None:
-            if self.occupied > self.capacity:
-                raise ValueError("occupied must be <= capacity")
-        return self
-
 
 class ZoneListResponse(BaseModel):
     items:  list[ZoneResponse]

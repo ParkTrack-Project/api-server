@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import os
-import cv2
-import numpy as np
-import requests
-from PIL import Image
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 
+import cv2
+import numpy as np
+import requests
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, GlobalRole, Partner, User, DataSource
-from ..dependencies import CurrentUser, require
+from ..db_models import Camera, DataSource, GlobalRole, Partner, User
+from ..dependencies import require
 from ..schemas.cameras import (
     CameraMapItemResponse,
     CameraNextResponse,
@@ -26,6 +25,18 @@ from ..schemas.cameras import (
 
 router = APIRouter(prefix="/cameras", tags=["Cameras"])
 
+
+SUPPORTED_SNAPSHOT_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
 
 def _serialize(c: Camera) -> CameraResponse:
     return CameraResponse(
@@ -69,11 +80,17 @@ def _serialize_next(c: Camera) -> CameraNextResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Common camera access helpers
+# ---------------------------------------------------------------------------
+
 def _get_camera_or_404(db: Session, camera_id: int) -> Camera:
     camera = db.query(Camera).filter(Camera.camera_id == camera_id).one_or_none()
     if camera is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail={"error_description": "Camera not found"})
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera not found"},
+        )
     return camera
 
 
@@ -92,33 +109,48 @@ def _has_global_camera_access(user: User) -> bool:
 def _scope_camera_query(query, user: User):
     if _has_global_camera_access(user):
         return query
+
     partner_ids = _active_partner_ids(user)
     if not partner_ids:
         return query.filter(Camera.camera_id.in_([]))
+
     return query.filter(Camera.partner_id.in_(partner_ids))
 
 
 def _ensure_camera_visible(camera: Camera, user: User):
     if _has_global_camera_access(user):
         return
+
     if camera.partner_id not in _active_partner_ids(user):
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail={"error_description": "Camera not found"})
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera not found"},
+        )
 
-
-def _normalize_partner_id_for_camera(body: CreateCameraRequest, user: User) -> int | None:
+def _normalize_partner_id_for_camera(
+    body: CreateCameraRequest,
+    user: User,
+) -> int | None:
     if _has_global_camera_access(user):
         return body.partner_id
 
     partner_ids = _active_partner_ids(user)
+
     if body.partner_id is None:
         if len(partner_ids) == 1:
             return next(iter(partner_ids))
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail={"error_description": "partner_id is required for partner camera creation"})
+
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_description": "partner_id is required for partner camera creation"},
+        )
+
     if body.partner_id not in partner_ids:
-        raise HTTPException(status.HTTP_403_FORBIDDEN,
-                            detail={"error_description": "Cannot manage cameras for this partner"})
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error_description": "Cannot manage cameras for this partner"},
+        )
+
     return body.partner_id
 
 
@@ -130,46 +162,53 @@ def _normalize_partner_id_for_camera(body: CreateCameraRequest, user: User) -> i
 def list_cameras(
     current_user: Annotated[User, require("cameras.view")],
     db: Annotated[Session, Depends(get_db)],
-    q:          str   | None = None,
-    partner_id: int   | None = None,
-    is_active:  bool  | None = None,
-    bbox:       str   | None = None,   # "min_lon,min_lat,max_lon,max_lat"
-    view:       str          = "full",
+    q: str | None = None,
+    partner_id: int | None = None,
+    is_active: bool | None = None,
+    bbox: str | None = None,  # "min_lon,min_lat,max_lon,max_lat"
+    view: str = "full",
 ):
     query = _scope_camera_query(db.query(Camera), current_user)
 
     if q:
         query = query.filter(Camera.title.icontains(q))
+
     if partner_id is not None:
         query = query.filter(Camera.partner_id == partner_id)
+
     if is_active is not None:
         query = query.filter(Camera.is_active == is_active)
+
     if bbox:
         try:
             min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(","))
         except ValueError:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                detail={"error_description": "bbox must be min_lon,min_lat,max_lon,max_lat"})
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error_description": "bbox must be min_lon,min_lat,max_lon,max_lat"},
+            )
+
         query = (
             query
             .filter(Camera.longitude >= min_lon)
-            .filter(Camera.latitude  >= min_lat)
+            .filter(Camera.latitude >= min_lat)
             .filter(Camera.longitude <= max_lon)
-            .filter(Camera.latitude  <= max_lat)
+            .filter(Camera.latitude <= max_lat)
         )
 
     cameras = query.order_by(Camera.camera_id).all()
 
     if view == "map":
         return [_serialize_map(c) for c in cameras]
+
     return [_serialize(c) for c in cameras]
 
 
 # ---------------------------------------------------------------------------
-# GET /cameras/next  — должен быть ДО /{camera_id}, иначе FastAPI съедает маршрут
+# GET /cameras/next
+# Должен быть ДО /{camera_id}, иначе FastAPI съедает маршрут.
 # ---------------------------------------------------------------------------
 
-# Простой round-robin через in-memory счётчик (как в оригинале)
 _camera_cursor: dict[str, int] = {"index": 0}
 
 
@@ -184,13 +223,17 @@ def get_next_camera(
         .order_by(Camera.camera_id)
         .all()
     )
+
     if not cameras:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-                            detail={"error_description": "No cameras added"})
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "No cameras added"},
+        )
 
     idx = _camera_cursor["index"] % len(cameras)
     camera = cameras[idx]
     _camera_cursor["index"] = idx + 1
+
     return _serialize_next(camera)
 
 
@@ -205,15 +248,20 @@ def create_camera(
     db: Annotated[Session, Depends(get_db)],
 ):
     if db.query(Camera).filter(Camera.title == body.title).one_or_none():
-        raise HTTPException(status.HTTP_409_CONFLICT,
-                            detail={"error_description": "Camera with this title already exists"})
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error_description": "Camera with this title already exists"},
+        )
 
     partner_id = _normalize_partner_id_for_camera(body, current_user)
 
     if partner_id is not None:
-        if not db.query(Partner).filter(Partner.partner_id == partner_id).one_or_none():
-            raise HTTPException(status.HTTP_404_NOT_FOUND,
-                                detail={"error_description": "Partner not found"})
+        partner = db.query(Partner).filter(Partner.partner_id == partner_id).one_or_none()
+        if partner is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error_description": "Partner not found"},
+            )
 
     camera = Camera(
         title=body.title,
@@ -227,6 +275,7 @@ def create_camera(
         created_by_user_id=current_user.user_id,
         is_active=True,
     )
+
     db.add(camera)
     db.flush()
 
@@ -240,6 +289,7 @@ def create_camera(
         status="active",
         is_active=True,
     )
+
     db.add(source)
     db.commit()
     db.refresh(camera)
@@ -259,6 +309,7 @@ def get_camera(
 ):
     camera = _get_camera_or_404(db, camera_id)
     _ensure_camera_visible(camera, current_user)
+
     return _serialize(camera)
 
 
@@ -277,15 +328,20 @@ def update_camera(
     _ensure_camera_visible(camera, current_user)
 
     update_data = body.model_dump(exclude_none=True)
+
     if "partner_id" in update_data and not _has_global_camera_access(current_user):
         if update_data["partner_id"] not in _active_partner_ids(current_user):
-            raise HTTPException(status.HTTP_403_FORBIDDEN,
-                                detail={"error_description": "Cannot manage cameras for this partner"})
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error_description": "Cannot manage cameras for this partner"},
+            )
+
     for field, value in update_data.items():
         setattr(camera, field, value)
 
     db.commit()
     db.refresh(camera)
+
     return _serialize(camera)
 
 
@@ -301,16 +357,18 @@ def delete_camera(
 ):
     camera = _get_camera_or_404(db, camera_id)
     _ensure_camera_visible(camera, current_user)
+
     db.delete(camera)
     db.commit()
+
     return None
 
 
 # ---------------------------------------------------------------------------
-# GET /cameras/{camera_id}/snapshot
+# Snapshot helpers
 # ---------------------------------------------------------------------------
 
-def read_frame_from_video(source: str):
+def _read_frame_from_video(source: str):
     cap = cv2.VideoCapture(source)
 
     try:
@@ -318,7 +376,6 @@ def read_frame_from_video(source: str):
             return None
 
         ret, frame = cap.read()
-
         if not ret or frame is None:
             return None
 
@@ -328,7 +385,7 @@ def read_frame_from_video(source: str):
         cap.release()
 
 
-def read_frame_from_image_url(source: str):
+def _read_frame_from_image_url(source: str):
     try:
         response = requests.get(source, timeout=5)
     except requests.RequestException:
@@ -351,38 +408,26 @@ def read_frame_from_image_url(source: str):
     return frame
 
 
-@router.get("/{camera_id}/snapshot")
-def get_snapshot(
-    camera_id: int,
-    current_user: Annotated[User, require("cameras.view")],
-    db: Annotated[Session, Depends(get_db)],
-    annotated:       bool = False,
-    fallback_to_raw: bool = False,
-):
-    camera = _get_camera_or_404(db, camera_id)
-    _ensure_camera_visible(camera, current_user)
+def _encode_frame_to_jpeg_response(frame) -> StreamingResponse:
+    success, buffer = cv2.imencode(".jpg", frame)
 
-    if annotated:
-        images_directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
-        if not images_directory:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"error_description": "Camera images directory is not configured"},
-            )
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_description": "Snapshot service unavailable"},
+        )
 
-        snapshot_path = Path(images_directory) / f"{camera_id}.jpg"
-        if not snapshot_path.is_file():
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                detail={"error_description": "Camera snapshot not available"},
-            )
+    out = BytesIO(buffer.tobytes())
+    out.seek(0)
 
-        return FileResponse(snapshot_path, media_type="image/jpeg")
+    return StreamingResponse(out, media_type="image/jpeg")
 
-    frame = read_frame_from_video(camera.source)
+
+def _get_live_raw_snapshot_response(camera: Camera) -> StreamingResponse:
+    frame = _read_frame_from_video(camera.source)
 
     if frame is None:
-        frame = read_frame_from_image_url(camera.source)
+        frame = _read_frame_from_image_url(camera.source)
 
     if frame is None:
         raise HTTPException(
@@ -390,15 +435,109 @@ def get_snapshot(
             detail={"error_description": "Camera snapshot not available"},
         )
 
-    success, buffer = cv2.imencode(".jpg", frame)
+    return _encode_frame_to_jpeg_response(frame)
 
-    if not success:
+
+def _get_first_existing_directory(env_names: tuple[str, ...]) -> Path | None:
+    for env_name in env_names:
+        directory = os.getenv(env_name)
+        if directory:
+            return Path(directory)
+
+    return None
+
+
+def _find_snapshot_file(directory: Path, camera_id: int) -> tuple[Path, str] | None:
+    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
+        path = directory / f"{camera_id}{extension}"
+
+        if path.is_file():
+            return path, media_type
+
+    return None
+
+
+def _build_file_snapshot_response(path: Path, media_type: str) -> FileResponse:
+    return FileResponse(path, media_type=media_type)
+
+
+def _try_get_annotated_snapshot_response(camera_id: int) -> FileResponse | None:
+    directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
+
+    if directory is None:
+        return None
+
+    directory = Path(directory)
+
+    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
+        path = directory / f"{camera_id}{extension}"
+
+        if path.is_file():
+            return _build_file_snapshot_response(path, media_type)
+
+    return None
+
+
+def _get_last_detection_snapshot_response(camera_id: int) -> FileResponse:
+    directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
+
+    if directory is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error_description": "Failed to encode snapshot"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_description": "Last detection snapshots directory is not configured"},
         )
 
-    out = BytesIO(buffer.tobytes())
-    out.seek(0)
+    directory = Path(directory)
 
-    return StreamingResponse(out, media_type="image/jpeg")
+    found = None
+    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
+        path = directory / f"{camera_id}_source{extension}"
+
+        if path.is_file():
+            found = path, media_type
+            break
+
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera snapshot not available"},
+        )
+
+    path, media_type = found
+    return _build_file_snapshot_response(path, media_type)
+
+
+# ---------------------------------------------------------------------------
+# GET /cameras/{camera_id}/snapshot
+# ---------------------------------------------------------------------------
+
+@router.get("/{camera_id}/snapshot")
+def get_snapshot(
+    camera_id: int,
+    current_user: Annotated[User, require("cameras.view")],
+    db: Annotated[Session, Depends(get_db)],
+    annotated: bool = False,
+    last_detection: bool = False,
+    fallback_to_raw: bool = False,
+):
+    camera = _get_camera_or_404(db, camera_id)
+    _ensure_camera_visible(camera, current_user)
+
+    if annotated:
+        # last_detection при annotated=true игнорируется.
+        annotated_response = _try_get_annotated_snapshot_response(camera_id)
+        if annotated_response is not None:
+            return annotated_response
+
+        if fallback_to_raw:
+            return _get_live_raw_snapshot_response(camera)
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera snapshot not available"},
+        )
+
+    if last_detection:
+        return _get_last_detection_snapshot_response(camera_id)
+
+    return _get_live_raw_snapshot_response(camera)

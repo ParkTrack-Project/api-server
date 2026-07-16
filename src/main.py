@@ -29,7 +29,7 @@ app.add_middleware(
         "https://parktrack.live",
         "https://dev.parktrack.live",
         "https://admin.dev.parktrack.live",
-        "https://m.parktrack.live"
+        "https://m.parktrack.live",
         "http://localhost:5173",
         "http://127.0.0.1:5173"
     ],

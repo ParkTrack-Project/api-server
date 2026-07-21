@@ -20,10 +20,15 @@ from src.schemas.routing import GeoPoint  # noqa: E402
 
 
 class _Response:
-    def __init__(self, status_code: int = 200, payload: object | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int = 200,
+        payload: object | None = None,
+        text: str = "provider response",
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
-        self.text = "provider response"
+        self.text = text
 
     def json(self):
         if isinstance(self._payload, ValueError):
@@ -130,9 +135,17 @@ class RoutingProviderTests(unittest.TestCase):
 
     def test_5xx_and_invalid_response_fall_back(self) -> None:
         pool = [_target(1)]
+        matrix_distance_error = (
+            '{"statusCode":400,"error":"Bad Request","message":'
+            '"Too long sum distance. Estimated sum distance is 428229726 meter(s)."}'
+        )
         responses = (
             (_Response(status_code=503, payload={}), "provider_5xx"),
             (_Response(status_code=429, payload={}), "provider_429"),
+            (
+                _Response(status_code=400, payload={}, text=matrix_distance_error),
+                "provider_matrix_distance_limit",
+            ),
             (_Response(payload=ValueError("bad json")), "invalid_provider_response"),
             (_Response(payload={"unexpected": []}), "invalid_provider_response"),
         )
@@ -145,16 +158,50 @@ class RoutingProviderTests(unittest.TestCase):
                 self.assertEqual(result.fallback_reason, expected_reason)
                 self.assertEqual(len(result.candidates), 1)
 
+    def test_oversized_matrix_falls_back_without_provider_call(self) -> None:
+        pool = [_target(index) for index in range(1, 33)]
+        far_point = GeoPoint(latitude=-55.0, longitude=-140.0)
+        pool = [
+            routing._ZoneTarget(
+                zone=item.zone,
+                point=far_point,
+                anchor_distance_meters=18_000_000 + index,
+                current_occupied=item.current_occupied,
+                current_free_count=item.current_free_count,
+                current_confidence=item.current_confidence,
+            )
+            for index, item in enumerate(pool)
+        ]
+        with patch.object(routing.requests, "post") as post:
+            result = _search(pool)
+
+        post.assert_not_called()
+        self.assertEqual(result.provider, "internal")
+        self.assertEqual(result.fallback_reason, "provider_matrix_distance_limit")
+        self.assertTrue(result.candidates)
+
 
 class RoutingSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _settings(max_matrix_targets: int) -> routing._RoutingSettings:
+        return routing._RoutingSettings(
+            search_budget_seconds=1.8,
+            provider_connect_timeout_seconds=0.25,
+            provider_read_timeout_seconds=0.9,
+            provider_max_estimated_matrix_distance_meters=280_000_000,
+            max_matrix_targets=max_matrix_targets,
+            road_detour_factor=1.25,
+            average_driving_speed_kph=30.0,
+        )
+
     def test_dynamic_matrix_limit(self) -> None:
-        settings = routing._RoutingSettings(1.8, 0.25, 0.9, 32, 1.25, 30.0)
+        settings = self._settings(32)
         pool = [_target(index) for index in range(1, 81)]
         self.assertEqual(len(routing._select_matrix_targets(pool, 2, settings)), 12)
         self.assertEqual(len(routing._select_matrix_targets(pool, 10, settings)), 32)
 
     def test_explicit_zone_is_always_included(self) -> None:
-        settings = routing._RoutingSettings(1.8, 0.25, 0.9, 12, 1.25, 30.0)
+        settings = self._settings(12)
         pool = [_target(index, distance=index * 100) for index in range(1, 31)]
         selected = routing._select_matrix_targets(
             pool, requested_limit=1, settings=settings, selected_zone_id=30

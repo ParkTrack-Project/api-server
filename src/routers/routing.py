@@ -74,6 +74,7 @@ class _RoutingSettings:
     search_budget_seconds: float
     provider_connect_timeout_seconds: float
     provider_read_timeout_seconds: float
+    provider_max_estimated_matrix_distance_meters: int
     max_matrix_targets: int
     road_detour_factor: float
     average_driving_speed_kph: float
@@ -101,6 +102,11 @@ def _routing_settings() -> _RoutingSettings:
         ),
         provider_read_timeout_seconds=_env_float(
             "ROUTING_PROVIDER_READ_TIMEOUT_SECONDS", 0.9, 0.01
+        ),
+        provider_max_estimated_matrix_distance_meters=_env_int(
+            "ROUTING_PROVIDER_MAX_ESTIMATED_MATRIX_DISTANCE_METERS",
+            280_000_000,
+            1,
         ),
         max_matrix_targets=_env_int("ROUTING_MAX_MATRIX_TARGETS", 32, 1),
         road_detour_factor=_env_float("ROUTING_ROAD_DETOUR_FACTOR", 1.25, 1.0),
@@ -455,6 +461,20 @@ def _geoapify_matrix(
     if not sources or not targets:
         return []
 
+    estimated_distance_sum = sum(
+        _haversine_meters(source, target) * settings.road_detour_factor
+        for source in sources
+        for target in targets
+    )
+    if (
+        estimated_distance_sum
+        > settings.provider_max_estimated_matrix_distance_meters
+    ):
+        raise RoutingProviderError(
+            "Estimated route matrix distance exceeds provider limit",
+            reason="provider_matrix_distance_limit",
+        )
+
     payload = {
         "mode": GEOAPIFY_MODE,
         "sources": [
@@ -509,10 +529,17 @@ def _geoapify_matrix(
         )
 
     if response.status_code >= 400:
+        response_preview = response.text[:300]
+        reason = "provider_429" if response.status_code == 429 else "provider_4xx"
+        if (
+            response.status_code == 400
+            and "too long sum distance" in response_preview.lower()
+        ):
+            reason = "provider_matrix_distance_limit"
         raise RoutingProviderError(
             f"Geoapify Route Matrix API rejected request: "
-            f"HTTP {response.status_code}: {response.text[:300]}",
-            reason="provider_429" if response.status_code == 429 else "provider_4xx",
+            f"HTTP {response.status_code}: {response_preview}",
+            reason=reason,
         )
 
     try:

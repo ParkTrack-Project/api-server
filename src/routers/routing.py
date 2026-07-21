@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import bisect
+import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, cast
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -49,24 +52,9 @@ GEOAPIFY_MODE = "drive"
 EARTH_RADIUS_METERS = 6_371_000
 METERS_PER_LATITUDE_DEGREE = 111_320
 
-MAX_CLUSTER_CONTEXT_TARGETS = 300
-MAX_MATRIX_TARGETS = 80
-MIN_CLUSTER_CONTEXT_FOR_COMPARE = 80
-
-RADIUS_STEPS_METERS: list[int | None] = [
-    500,
-    1_000,
-    2_000,
-    5_000,
-    10_000,
-    25_000,
-    50_000,
-    100_000,
-    250_000,
-    500_000,
-    1_000_000,
-    None,
-]
+MAX_CLUSTER_CONTEXT_TARGETS = 160
+MIN_CLUSTER_CONTEXT_FOR_COMPARE = 48
+PRIMARY_SEARCH_RADIUS_METERS = 5_000
 
 CLUSTER_RADIUS_METERS = 500
 GOOD_ALTERNATIVE_MIN_PROBABILITY = 0.35
@@ -78,13 +66,64 @@ FORECAST_LOOKAROUND = timedelta(hours=2)
 
 PUBLIC_ROUTING_USER_ID_ENV = "PUBLIC_ROUTING_USER_ID"
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RoutingSettings:
+    search_budget_seconds: float
+    provider_connect_timeout_seconds: float
+    provider_read_timeout_seconds: float
+    provider_max_estimated_matrix_distance_meters: int
+    max_matrix_targets: int
+    road_detour_factor: float
+    average_driving_speed_kph: float
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _routing_settings() -> _RoutingSettings:
+    return _RoutingSettings(
+        search_budget_seconds=_env_float("ROUTING_SEARCH_BUDGET_SECONDS", 1.8, 0.1),
+        provider_connect_timeout_seconds=_env_float(
+            "ROUTING_PROVIDER_CONNECT_TIMEOUT_SECONDS", 0.25, 0.01
+        ),
+        provider_read_timeout_seconds=_env_float(
+            "ROUTING_PROVIDER_READ_TIMEOUT_SECONDS", 0.9, 0.01
+        ),
+        provider_max_estimated_matrix_distance_meters=_env_int(
+            "ROUTING_PROVIDER_MAX_ESTIMATED_MATRIX_DISTANCE_METERS",
+            280_000_000,
+            1,
+        ),
+        max_matrix_targets=_env_int("ROUTING_MAX_MATRIX_TARGETS", 32, 1),
+        road_detour_factor=_env_float("ROUTING_ROAD_DETOUR_FACTOR", 1.25, 1.0),
+        average_driving_speed_kph=_env_float(
+            "ROUTING_AVERAGE_DRIVING_SPEED_KPH", 30.0, 1.0
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Внутренние типы
 # ---------------------------------------------------------------------------
 
 class RoutingProviderError(Exception):
-    pass
+    def __init__(self, message: str, reason: str = "provider_error") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -154,6 +193,23 @@ class _CandidateContext:
 class _CandidateSearchResult:
     candidates: list[RouteCandidate]
     total_candidates: int
+    provider: str
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _ForecastSeries:
+    forecasts: list[Forecast]
+    predicted_timestamps: list[float]
+
+
+@dataclass
+class _RankingRequestContext:
+    forecasts_by_zone: dict[int, _ForecastSeries]
+    cluster_neighbors: dict[int, list[tuple[_ZoneTarget, int]]]
+    effective_state_cache: dict[
+        tuple[int, int], tuple[int, float, float, _ForecastView]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +265,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _clamp_float(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
+
+
+def _remaining_seconds(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
 
 
 def _serialize_route(route: Route) -> RouteResponse:
@@ -395,9 +455,25 @@ def _geoapify_api_key() -> str:
 def _geoapify_matrix(
     sources: list[GeoPoint],
     targets: list[GeoPoint],
+    deadline: float,
+    settings: _RoutingSettings,
 ) -> list[list[dict[str, Any]]]:
     if not sources or not targets:
         return []
+
+    estimated_distance_sum = sum(
+        _haversine_meters(source, target) * settings.road_detour_factor
+        for source in sources
+        for target in targets
+    )
+    if (
+        estimated_distance_sum
+        > settings.provider_max_estimated_matrix_distance_meters
+    ):
+        raise RoutingProviderError(
+            "Estimated route matrix distance exceeds provider limit",
+            reason="provider_matrix_distance_limit",
+        )
 
     payload = {
         "mode": GEOAPIFY_MODE,
@@ -411,37 +487,76 @@ def _geoapify_matrix(
         ],
     }
 
+    remaining = _remaining_seconds(deadline)
+    if remaining <= 0.05:
+        raise RoutingProviderError(
+            "Routing budget exhausted before provider call",
+            reason="insufficient_remaining_time",
+        )
+
+    connect_timeout = min(settings.provider_connect_timeout_seconds, remaining)
+    read_budget = remaining - connect_timeout
+    if read_budget <= 0.01:
+        raise RoutingProviderError(
+            "Routing budget is insufficient for provider response",
+            reason="insufficient_remaining_time",
+        )
+    read_timeout = min(settings.provider_read_timeout_seconds, read_budget)
+
     try:
         response = requests.post(
             GEOAPIFY_ROUTEMATRIX_URL,
             params={"apiKey": _geoapify_api_key()},
             headers={"Content-Type": "application/json"},
             json=payload,
-            timeout=15,
+            timeout=(connect_timeout, read_timeout),
         )
+    except requests.Timeout as exc:
+        raise RoutingProviderError(
+            "Geoapify Route Matrix API timed out",
+            reason="provider_timeout",
+        ) from exc
     except requests.RequestException as exc:
-        raise RoutingProviderError("Geoapify Route Matrix API is unavailable") from exc
+        raise RoutingProviderError(
+            "Geoapify Route Matrix API is unavailable",
+            reason="provider_network_error",
+        ) from exc
 
     if response.status_code >= 500:
         raise RoutingProviderError(
-            f"Geoapify Route Matrix API is unavailable: HTTP {response.status_code}"
+            f"Geoapify Route Matrix API is unavailable: HTTP {response.status_code}",
+            reason="provider_5xx",
         )
 
     if response.status_code >= 400:
+        response_preview = response.text[:300]
+        reason = "provider_429" if response.status_code == 429 else "provider_4xx"
+        if (
+            response.status_code == 400
+            and "too long sum distance" in response_preview.lower()
+        ):
+            reason = "provider_matrix_distance_limit"
         raise RoutingProviderError(
             f"Geoapify Route Matrix API rejected request: "
-            f"HTTP {response.status_code}: {response.text[:300]}"
+            f"HTTP {response.status_code}: {response_preview}",
+            reason=reason,
         )
 
     try:
         data = response.json()
     except ValueError as exc:
-        raise RoutingProviderError("Geoapify returned invalid JSON") from exc
+        raise RoutingProviderError(
+            "Geoapify returned invalid JSON",
+            reason="invalid_provider_response",
+        ) from exc
 
     matrix = data.get("sources_to_targets")
 
     if not isinstance(matrix, list):
-        raise RoutingProviderError("Geoapify response does not contain sources_to_targets")
+        raise RoutingProviderError(
+            "Geoapify response does not contain sources_to_targets",
+            reason="invalid_provider_response",
+        )
 
     return matrix
 
@@ -610,33 +725,33 @@ def _zone_to_target(zone: ParkingZone, anchor: GeoPoint) -> _ZoneTarget | None:
     )
 
 
-def _required_cluster_pool_size(limit: int) -> int:
+def _matrix_target_count(limit: int, settings: _RoutingSettings) -> int:
+    return min(settings.max_matrix_targets, max(12, limit * 4))
+
+
+def _required_cluster_pool_size(limit: int, settings: _RoutingSettings) -> int:
     return min(
         MAX_CLUSTER_CONTEXT_TARGETS,
-        max(MIN_CLUSTER_CONTEXT_FOR_COMPARE, limit * 12),
+        max(
+            MIN_CLUSTER_CONTEXT_FOR_COMPARE,
+            _matrix_target_count(limit, settings) * 3,
+        ),
     )
 
 
-def _radius_steps_for_request(
+def _candidate_query_radii(
     mode: str,
     max_distance_to_destination_meters: int | None,
 ) -> list[int | None]:
-    if mode != "route_to_destination" or max_distance_to_destination_meters is None:
-        return RADIUS_STEPS_METERS
+    if mode == "route_to_destination" and max_distance_to_destination_meters is not None:
+        primary = min(PRIMARY_SEARCH_RADIUS_METERS, max_distance_to_destination_meters)
+        if primary == max_distance_to_destination_meters:
+            return [primary]
+        return [primary, max_distance_to_destination_meters]
 
-    limited_steps: list[int | None] = []
-
-    for radius in RADIUS_STEPS_METERS:
-        if radius is None:
-            break
-
-        if radius <= max_distance_to_destination_meters:
-            limited_steps.append(radius)
-
-    if max_distance_to_destination_meters not in limited_steps:
-        limited_steps.append(max_distance_to_destination_meters)
-
-    return limited_steps
+    # Второй запрос — единственный расширенный fallback без искусственного
+    # ограничения дальности, сохраняющий прежнюю семантику поиска.
+    return [PRIMARY_SEARCH_RADIUS_METERS, None]
 
 
 def _query_zone_targets_near_anchor(
@@ -648,8 +763,10 @@ def _query_zone_targets_near_anchor(
     max_distance_to_destination_meters: int | None,
     limit: int,
     selected_zone_id: int | None,
+    deadline: float,
+    settings: _RoutingSettings,
 ) -> list[_ZoneTarget]:
-    required_count = _required_cluster_pool_size(limit)
+    required_count = _required_cluster_pool_size(limit, settings)
 
     if selected_zone_id is not None:
         zone = (
@@ -671,10 +788,14 @@ def _query_zone_targets_near_anchor(
 
     last_non_empty: list[_ZoneTarget] = []
 
-    for radius in _radius_steps_for_request(
+    radii = _candidate_query_radii(
         mode=mode,
         max_distance_to_destination_meters=max_distance_to_destination_meters,
-    ):
+    )
+    for query_number, radius in enumerate(radii, start=1):
+        if query_number > 1 and _remaining_seconds(deadline) <= 0.05:
+            break
+
         query = _base_zone_query(
             db=db,
             max_pay=max_pay,
@@ -692,7 +813,7 @@ def _query_zone_targets_near_anchor(
         zones = (
             query
             .order_by(_approx_distance_expr(anchor).asc())
-            .limit(MAX_CLUSTER_CONTEXT_TARGETS)
+            .limit(required_count)
             .all()
         )
 
@@ -713,9 +834,9 @@ def _query_zone_targets_near_anchor(
             last_non_empty = targets
 
         if len(targets) >= required_count:
-            return targets[:MAX_CLUSTER_CONTEXT_TARGETS]
+            return targets[:required_count]
 
-    return last_non_empty[:MAX_CLUSTER_CONTEXT_TARGETS]
+    return last_non_empty[:required_count]
 
 
 def _matrix_preselection_key(target: _ZoneTarget) -> tuple[Any, ...]:
@@ -730,66 +851,126 @@ def _matrix_preselection_key(target: _ZoneTarget) -> tuple[Any, ...]:
 
     pay = max(_safe_int(target.zone.pay), 0)
 
+    freshness = _datetime_timestamp(
+        cast(datetime | None, getattr(target.zone, "occupancy_updated_at", None))
+    )
+
     return (
         distance_band,
         availability_band,
+        -target.current_confidence,
+        -freshness,
         target.anchor_distance_meters,
         pay,
         int(target.zone.parking_zone_id),
     )
 
 
-def _select_matrix_targets(cluster_pool: list[_ZoneTarget]) -> list[_ZoneTarget]:
-    return sorted(cluster_pool, key=_matrix_preselection_key)[:MAX_MATRIX_TARGETS]
+def _select_matrix_targets(
+    cluster_pool: list[_ZoneTarget],
+    requested_limit: int,
+    settings: _RoutingSettings,
+    selected_zone_id: int | None = None,
+) -> list[_ZoneTarget]:
+    target_count = _matrix_target_count(requested_limit, settings)
+    selected = sorted(cluster_pool, key=_matrix_preselection_key)[:target_count]
+
+    if selected_zone_id is None or any(
+        int(item.zone.parking_zone_id) == selected_zone_id for item in selected
+    ):
+        return selected
+
+    explicit = next(
+        (
+            item
+            for item in cluster_pool
+            if int(item.zone.parking_zone_id) == selected_zone_id
+        ),
+        None,
+    )
+    if explicit is None:
+        return selected
+    if len(selected) >= target_count:
+        selected[-1] = explicit
+    else:
+        selected.append(explicit)
+    return selected
 
 
 # ---------------------------------------------------------------------------
 # Forecast helpers
 # ---------------------------------------------------------------------------
 
+def _latest_forecasts_statement(
+    zone_ids: list[int],
+    from_time: datetime,
+    to_time: datetime,
+):
+    ranked = (
+        select(
+            Forecast.forecast_id.label("forecast_id"),
+            func.row_number().over(
+                partition_by=(Forecast.zone_id, Forecast.predicted_for),
+                order_by=(Forecast.generated_at.desc(), Forecast.forecast_id.desc()),
+            ).label("generation_rank"),
+        )
+        .where(Forecast.zone_id.in_(zone_ids))
+        .where(Forecast.predicted_for >= from_time)
+        .where(Forecast.predicted_for <= to_time)
+        .subquery()
+    )
+
+    return (
+        select(Forecast)
+        .join(ranked, Forecast.forecast_id == ranked.c.forecast_id)
+        .where(ranked.c.generation_rank == 1)
+        .order_by(Forecast.zone_id.asc(), Forecast.predicted_for.asc())
+    )
+
+
 def _load_forecasts_for_zones(
     db: Session,
     zone_ids: list[int],
     min_arrival: datetime,
     max_arrival: datetime,
-) -> dict[int, list[Forecast]]:
+) -> dict[int, _ForecastSeries]:
     if not zone_ids:
         return {}
 
     from_time = _to_utc_naive(min_arrival - FORECAST_LOOKAROUND)
     to_time = _to_utc_naive(max_arrival + FORECAST_LOOKAROUND)
+    statement = _latest_forecasts_statement(zone_ids, from_time, to_time)
+    rows = db.execute(statement).scalars().all()
 
-    rows = (
-        db.query(Forecast)
-        .filter(Forecast.zone_id.in_(zone_ids))
-        .filter(Forecast.predicted_for >= from_time)
-        .filter(Forecast.predicted_for <= to_time)
-        .order_by(
-            Forecast.zone_id.asc(),
-            Forecast.predicted_for.asc(),
-            Forecast.generated_at.desc(),
-            Forecast.forecast_id.desc(),
-        )
-        .all()
-    )
-
-    result: dict[int, list[Forecast]] = {}
+    grouped: dict[int, list[Forecast]] = {}
 
     for forecast in rows:
-        result.setdefault(int(forecast.zone_id), []).append(forecast)
+        grouped.setdefault(int(forecast.zone_id), []).append(forecast)
 
-    return result
+    return {
+        zone_id: _ForecastSeries(
+            forecasts=forecasts,
+            predicted_timestamps=[
+                _datetime_timestamp(item.predicted_for) for item in forecasts
+            ],
+        )
+        for zone_id, forecasts in grouped.items()
+    }
 
 
 def _pick_forecast_for_arrival(
-    forecasts: list[Forecast],
+    series: _ForecastSeries | None,
     arrival_time: datetime,
 ) -> Forecast | None:
-    if not forecasts:
+    if series is None or not series.forecasts:
         return None
 
+    arrival_timestamp = _datetime_timestamp(arrival_time)
+    index = bisect.bisect_left(series.predicted_timestamps, arrival_timestamp)
+    candidate_indexes = range(max(0, index - 1), min(len(series.forecasts), index + 1))
+
     return min(
-        forecasts,
+        (series.forecasts[candidate_index] for candidate_index in candidate_indexes),
         key=lambda forecast: (
             _seconds_between(forecast.predicted_for, arrival_time),
             -_datetime_timestamp(forecast.generated_at),
@@ -884,20 +1065,70 @@ def _availability_probability(
 # Cluster / fallback alternatives
 # ---------------------------------------------------------------------------
 
+def _build_cluster_neighbors(
+    candidate_targets: list[_ZoneTarget],
+    cluster_pool: list[_ZoneTarget],
+) -> dict[int, list[tuple[_ZoneTarget, int]]]:
+    if not candidate_targets or not cluster_pool:
+        return {}
+
+    reference_latitude = (
+        sum(item.point.latitude for item in cluster_pool) / len(cluster_pool)
+    )
+    reference_longitude = cluster_pool[0].point.longitude
+    longitude_scale = max(abs(math.cos(math.radians(reference_latitude))), 1e-6)
+
+    def cell_for(target: _ZoneTarget) -> tuple[int, int]:
+        longitude_delta = (
+            (target.point.longitude - reference_longitude + 180.0) % 360.0
+        ) - 180.0
+        x = math.radians(longitude_delta) * EARTH_RADIUS_METERS * longitude_scale
+        y = math.radians(target.point.latitude) * EARTH_RADIUS_METERS
+        return (
+            math.floor(x / CLUSTER_RADIUS_METERS),
+            math.floor(y / CLUSTER_RADIUS_METERS),
+        )
+
+    grid: dict[tuple[int, int], list[_ZoneTarget]] = {}
+    for target in cluster_pool:
+        grid.setdefault(cell_for(target), []).append(target)
+
+    result: dict[int, list[tuple[_ZoneTarget, int]]] = {}
+    for candidate in candidate_targets:
+        candidate_zone_id = int(candidate.zone.parking_zone_id)
+        cell_x, cell_y = cell_for(candidate)
+        neighbors: list[tuple[_ZoneTarget, int]] = []
+        for delta_x in (-1, 0, 1):
+            for delta_y in (-1, 0, 1):
+                for alternative in grid.get((cell_x + delta_x, cell_y + delta_y), []):
+                    if int(alternative.zone.parking_zone_id) == candidate_zone_id:
+                        continue
+                    distance = _haversine_meters(candidate.point, alternative.point)
+                    if distance <= CLUSTER_RADIUS_METERS:
+                        neighbors.append((alternative, distance))
+        result[candidate_zone_id] = neighbors
+
+    return result
+
 def _effective_state_for_target_at_arrival(
     target: _ZoneTarget,
     arrival_time: datetime,
-    forecasts_by_zone: dict[int, list[Forecast]],
+    request_context: _RankingRequestContext,
     use_forecast: bool,
 ) -> tuple[int, float, float, _ForecastView]:
     zone_id = int(target.zone.parking_zone_id)
+    cache_key = (zone_id, int(_datetime_timestamp(arrival_time)))
+    cached = request_context.effective_state_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     capacity = max(_safe_int(target.zone.capacity), 0)
 
     forecast = None
 
     if use_forecast:
         forecast = _pick_forecast_for_arrival(
-            forecasts_by_zone.get(zone_id, []),
+            request_context.forecasts_by_zone.get(zone_id),
             arrival_time,
         )
 
@@ -924,14 +1155,15 @@ def _effective_state_for_target_at_arrival(
         use_forecast=use_forecast,
     )
 
-    return effective_free, effective_confidence, probability, view
+    state = effective_free, effective_confidence, probability, view
+    request_context.effective_state_cache[cache_key] = state
+    return state
 
 
 def _cluster_metrics(
     candidate_target: _ZoneTarget,
     arrival_time: datetime,
-    cluster_pool: list[_ZoneTarget],
-    forecasts_by_zone: dict[int, list[Forecast]],
+    request_context: _RankingRequestContext,
     use_forecast: bool,
 ) -> _ClusterMetrics:
     alternative_count = 0
@@ -940,21 +1172,15 @@ def _cluster_metrics(
     best_probability = 0.0
     nearest_good_distance: int | None = None
 
-    for alternative in cluster_pool:
-        if alternative.zone.parking_zone_id == candidate_target.zone.parking_zone_id:
-            continue
-
-        distance = _haversine_meters(candidate_target.point, alternative.point)
-
-        if distance > CLUSTER_RADIUS_METERS:
-            continue
+    zone_id = int(candidate_target.zone.parking_zone_id)
+    for alternative, distance in request_context.cluster_neighbors.get(zone_id, []):
 
         alternative_count += 1
 
         effective_free, _, probability, _ = _effective_state_for_target_at_arrival(
             target=alternative,
             arrival_time=arrival_time,
-            forecasts_by_zone=forecasts_by_zone,
+            request_context=request_context,
             use_forecast=use_forecast,
         )
 
@@ -1197,8 +1423,7 @@ def _candidate_reasons(
 
 def _build_ranking_context(
     routed: _RoutedCandidate,
-    cluster_pool: list[_ZoneTarget],
-    forecasts_by_zone: dict[int, list[Forecast]],
+    request_context: _RankingRequestContext,
     use_forecast: bool,
 ) -> _CandidateContext:
     target = routed.zone_target
@@ -1212,7 +1437,7 @@ def _build_ranking_context(
         _effective_state_for_target_at_arrival(
             target=target,
             arrival_time=routed.arrival_time,
-            forecasts_by_zone=forecasts_by_zone,
+            request_context=request_context,
             use_forecast=use_forecast,
         )
     )
@@ -1220,8 +1445,7 @@ def _build_ranking_context(
     cluster = _cluster_metrics(
         candidate_target=target,
         arrival_time=routed.arrival_time,
-        cluster_pool=cluster_pool,
-        forecasts_by_zone=forecasts_by_zone,
+        request_context=request_context,
         use_forecast=use_forecast,
     )
 
@@ -1519,10 +1743,12 @@ def _finalize_contexts(contexts: list[_CandidateContext]) -> list[RouteCandidate
 # Route matrix
 # ---------------------------------------------------------------------------
 
-def _route_zone_pool(
+def _route_zone_pool_with_provider(
     origin: GeoPoint,
     destination: GeoPoint | None,
     zone_targets: list[_ZoneTarget],
+    deadline: float,
+    settings: _RoutingSettings,
 ) -> list[_RoutedCandidate]:
     if not zone_targets:
         return []
@@ -1530,6 +1756,8 @@ def _route_zone_pool(
     matrix = _geoapify_matrix(
         sources=[origin],
         targets=[item.point for item in zone_targets],
+        deadline=deadline,
+        settings=settings,
     )
 
     now = datetime.now(timezone.utc)
@@ -1539,7 +1767,10 @@ def _route_zone_pool(
         from_origin = _matrix_cell(matrix, 0, index)
 
         if from_origin is None:
-            continue
+            raise RoutingProviderError(
+                "Geoapify returned an incomplete route matrix",
+                reason="invalid_provider_response",
+            )
 
         distance_from_origin, duration_from_origin = from_origin
         arrival_time = now + timedelta(seconds=duration_from_origin)
@@ -1566,6 +1797,46 @@ def _route_zone_pool(
     return routed
 
 
+def _route_zone_pool_locally(
+    origin: GeoPoint,
+    destination: GeoPoint | None,
+    zone_targets: list[_ZoneTarget],
+    settings: _RoutingSettings,
+) -> list[_RoutedCandidate]:
+    now = datetime.now(timezone.utc)
+    driving_speed_mps = settings.average_driving_speed_kph / 3.6
+    routed: list[_RoutedCandidate] = []
+
+    for item in zone_targets:
+        direct_from_origin = _haversine_meters(origin, item.point)
+        driving_distance = int(round(direct_from_origin * settings.road_detour_factor))
+        driving_duration = max(30, int(round(driving_distance / driving_speed_mps)))
+
+        distance_to_destination: int | None = None
+        duration_to_destination: int | None = None
+        if destination is not None:
+            direct_to_destination = _haversine_meters(item.point, destination)
+            distance_to_destination = int(
+                round(direct_to_destination * WALKING_DETOUR_FACTOR)
+            )
+            duration_to_destination = _estimated_walking_seconds(
+                direct_to_destination
+            )
+
+        routed.append(
+            _RoutedCandidate(
+                zone_target=item,
+                distance_from_origin_meters=driving_distance,
+                duration_from_origin_seconds=driving_duration,
+                distance_to_destination_meters=distance_to_destination,
+                duration_to_destination_seconds=duration_to_destination,
+                arrival_time=now + timedelta(seconds=driving_duration),
+            )
+        )
+
+    return routed
+
+
 # ---------------------------------------------------------------------------
 # Основной поиск
 # ---------------------------------------------------------------------------
@@ -1585,6 +1856,45 @@ def _search_candidates(
     limit: int,
     selected_zone_id: int | None = None,
 ) -> _CandidateSearchResult:
+    started = time.monotonic()
+    settings = _routing_settings()
+    deadline = started + settings.search_budget_seconds
+    candidate_query_ms = 0.0
+    provider_ms = 0.0
+    forecast_query_ms = 0.0
+    ranking_ms = 0.0
+    provider_used = GEOAPIFY_PROVIDER_NAME
+    fallback_reason: str | None = None
+    candidate_count = 0
+    matrix_target_count = 0
+
+    def finish(
+        candidates: list[RouteCandidate],
+        total_candidates: int,
+    ) -> _CandidateSearchResult:
+        total_ms = (time.monotonic() - started) * 1_000
+        logger.info(
+            "routing_search candidate_query_ms=%.1f provider_ms=%.1f "
+            "forecast_query_ms=%.1f ranking_ms=%.1f total_ms=%.1f "
+            "provider_used=%s candidate_count=%d matrix_target_count=%d "
+            "fallback_reason=%s",
+            candidate_query_ms,
+            provider_ms,
+            forecast_query_ms,
+            ranking_ms,
+            total_ms,
+            provider_used,
+            candidate_count,
+            matrix_target_count,
+            fallback_reason or "none",
+        )
+        return _CandidateSearchResult(
+            candidates=candidates,
+            total_candidates=total_candidates,
+            provider=provider_used,
+            fallback_reason=fallback_reason,
+        )
+
     if mode == "route_to_destination" and destination is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1593,6 +1903,7 @@ def _search_candidates(
 
     anchor = destination if mode == "route_to_destination" and destination is not None else origin
 
+    stage_started = time.monotonic()
     cluster_pool = _query_zone_targets_near_anchor(
         db=db,
         anchor=anchor,
@@ -1602,18 +1913,42 @@ def _search_candidates(
         max_distance_to_destination_meters=max_distance_to_destination_meters,
         limit=limit,
         selected_zone_id=selected_zone_id,
+        deadline=deadline,
+        settings=settings,
     )
+    candidate_query_ms = (time.monotonic() - stage_started) * 1_000
+    candidate_count = len(cluster_pool)
 
-    matrix_targets = _select_matrix_targets(cluster_pool)
-
-    routed_candidates = _route_zone_pool(
-        origin=origin,
-        destination=destination,
-        zone_targets=matrix_targets,
+    matrix_targets = _select_matrix_targets(
+        cluster_pool=cluster_pool,
+        requested_limit=limit,
+        settings=settings,
+        selected_zone_id=selected_zone_id,
     )
+    matrix_target_count = len(matrix_targets)
+
+    stage_started = time.monotonic()
+    try:
+        routed_candidates = _route_zone_pool_with_provider(
+            origin=origin,
+            destination=destination,
+            zone_targets=matrix_targets,
+            deadline=deadline,
+            settings=settings,
+        )
+    except RoutingProviderError as exc:
+        provider_used = "internal"
+        fallback_reason = exc.reason
+        routed_candidates = _route_zone_pool_locally(
+            origin=origin,
+            destination=destination,
+            zone_targets=matrix_targets,
+            settings=settings,
+        )
+    provider_ms = (time.monotonic() - stage_started) * 1_000
 
     if not routed_candidates:
-        return _CandidateSearchResult(candidates=[], total_candidates=0)
+        return finish([], 0)
 
     filtered_by_explicit_constraints: list[_RoutedCandidate] = []
 
@@ -1634,36 +1969,50 @@ def _search_candidates(
         filtered_by_explicit_constraints.append(routed)
 
     if not filtered_by_explicit_constraints:
-        return _CandidateSearchResult(candidates=[], total_candidates=0)
+        return finish([], 0)
 
     min_arrival = min(item.arrival_time for item in filtered_by_explicit_constraints)
     max_arrival = max(item.arrival_time for item in filtered_by_explicit_constraints)
 
-    forecast_zone_ids = sorted(
-        {
-            int(target.zone.parking_zone_id)
-            for target in cluster_pool
-        }
+    cluster_neighbors = _build_cluster_neighbors(
+        candidate_targets=[item.zone_target for item in filtered_by_explicit_constraints],
+        cluster_pool=cluster_pool,
     )
+    forecast_zone_ids = {
+        int(item.zone_target.zone.parking_zone_id)
+        for item in filtered_by_explicit_constraints
+    }
+    for neighbors in cluster_neighbors.values():
+        forecast_zone_ids.update(
+            int(target.zone.parking_zone_id) for target, _ in neighbors
+        )
 
-    forecasts_by_zone = (
-        _load_forecasts_for_zones(
+    forecasts_by_zone: dict[int, _ForecastSeries] = {}
+    if use_forecast and _remaining_seconds(deadline) > 0.05:
+        stage_started = time.monotonic()
+        forecasts_by_zone = _load_forecasts_for_zones(
             db=db,
-            zone_ids=forecast_zone_ids,
+            zone_ids=sorted(forecast_zone_ids),
             min_arrival=min_arrival,
             max_arrival=max_arrival,
         )
-        if use_forecast
-        else {}
+        forecast_query_ms = (time.monotonic() - stage_started) * 1_000
+    elif use_forecast:
+        fallback_reason = fallback_reason or "insufficient_time_for_forecasts"
+
+    request_context = _RankingRequestContext(
+        forecasts_by_zone=forecasts_by_zone,
+        cluster_neighbors=cluster_neighbors,
+        effective_state_cache={},
     )
 
     contexts: list[_CandidateContext] = []
 
+    stage_started = time.monotonic()
     for routed in filtered_by_explicit_constraints:
         context = _build_ranking_context(
             routed=routed,
-            cluster_pool=cluster_pool,
-            forecasts_by_zone=forecasts_by_zone,
+            request_context=request_context,
             use_forecast=use_forecast,
         )
 
@@ -1676,15 +2025,14 @@ def _search_candidates(
         contexts.append(context)
 
     if not contexts:
-        return _CandidateSearchResult(candidates=[], total_candidates=0)
+        ranking_ms = (time.monotonic() - stage_started) * 1_000
+        return finish([], 0)
 
     ranked_candidates = _finalize_contexts(contexts)
+    ranking_ms = (time.monotonic() - stage_started) * 1_000
     total_candidates = len(ranked_candidates)
 
-    return _CandidateSearchResult(
-        candidates=ranked_candidates[:limit],
-        total_candidates=total_candidates,
-    )
+    return finish(ranked_candidates[:limit], total_candidates)
 
 
 def _selected_candidate_or_422(
@@ -1694,7 +2042,7 @@ def _selected_candidate_or_422(
     mode: str,
     use_forecast: bool,
     selected_zone_id: int,
-) -> RouteCandidate:
+) -> tuple[RouteCandidate, str]:
     result = _search_candidates(
         db=db,
         origin=origin,
@@ -1717,7 +2065,7 @@ def _selected_candidate_or_422(
             detail={"error_description": "Cannot build route to the selected zone"},
         )
 
-    return result.candidates[0]
+    return result.candidates[0], result.provider
 
 
 # ---------------------------------------------------------------------------
@@ -1751,7 +2099,7 @@ def search_routing(
 
     return SearchRoutingResponse(
         mode=body.mode,
-        provider=GEOAPIFY_PROVIDER_NAME,
+        provider=result.provider,
         generated_at=datetime.now(timezone.utc),
         selected_zone_id=selected_zone_id,
         total_candidates=result.total_candidates,
@@ -1827,7 +2175,7 @@ def create_route(
     route = Route(
         user_id=public_user_id,
         mode=RouteMode(body.mode),
-        provider=GEOAPIFY_PROVIDER_NAME,
+        provider=result.provider,
         origin_latitude=body.origin.latitude,
         origin_longitude=body.origin.longitude,
         destination_latitude=body.destination.latitude if body.destination else None,
@@ -1977,7 +2325,7 @@ def update_route(
             )
 
         try:
-            candidate = _selected_candidate_or_422(
+            candidate, provider_used = _selected_candidate_or_422(
                 db=db,
                 origin=origin,
                 destination=destination,
@@ -1990,7 +2338,7 @@ def update_route(
 
         centroid = _zone_point_from_centroid_columns(zone)
 
-        route.provider = GEOAPIFY_PROVIDER_NAME
+        route.provider = provider_used
         route.selected_zone_id = body.selected_zone_id
         route.selected_candidate = candidate.model_dump(mode="json")
         route.eta_seconds = candidate.duration_from_origin_seconds

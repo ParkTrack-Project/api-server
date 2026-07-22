@@ -601,14 +601,22 @@ def _available_artifact_url(
     detection_run_id: int,
     variant: str,
 ) -> str | None:
-    if snapshot_reference_from_metadata(metadata, variant) is None:
+    snapshots = metadata.get("snapshots")
+
+    if not isinstance(snapshots, dict):
         return None
 
-    return _artifact_url(
-        request,
-        detection_run_id,
-        variant,
-    )
+    artifact = snapshots.get(variant)
+
+    if not isinstance(artifact, dict):
+        return None
+
+    url = artifact.get("url")
+
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    return url
 
 
 def _detection_artifact_response(

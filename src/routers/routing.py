@@ -62,6 +62,12 @@ GOOD_ALTERNATIVE_MIN_PROBABILITY = 0.35
 WALKING_SPEED_METERS_PER_SECOND = 1.35
 WALKING_DETOUR_FACTOR = 1.35
 
+# После того как у парковки есть достаточный запас (два места), лишние места
+# дают быстро убывающую пользу. Для маршрута к точке назначения важнее не
+# заставлять человека идти несколько кварталов ради избыточного запаса мест.
+SUFFICIENT_FREE_SPACES = 2
+DESTINATION_WALK_COST_MULTIPLIER = 2.5
+
 FORECAST_LOOKAROUND = timedelta(hours=2)
 
 PUBLIC_ROUTING_USER_ID_ENV = "PUBLIC_ROUTING_USER_ID"
@@ -1338,8 +1344,14 @@ def _availability_bonus_seconds(
     effective_free_count: int,
     availability_strength: float,
     probability_free_space: float,
+    prioritize_destination: bool,
 ) -> float:
-    free_bonus = min(max(effective_free_count - 1, 0) * 220.0, 900.0)
+    free_count_for_bonus = effective_free_count
+
+    if prioritize_destination:
+        free_count_for_bonus = min(free_count_for_bonus, SUFFICIENT_FREE_SPACES)
+
+    free_bonus = min(max(free_count_for_bonus - 1, 0) * 220.0, 900.0)
     strength_bonus = availability_strength * 300.0
     probability_bonus = probability_free_space * 220.0
 
@@ -1480,17 +1492,19 @@ def _build_ranking_context(
         effective_free_count=effective_free,
         availability_strength=availability_strength,
         probability_free_space=probability,
+        prioritize_destination=routed.duration_to_destination_seconds is not None,
     )
 
     cluster_bonus = _cluster_bonus_seconds(cluster.cluster_strength)
 
     walk_seconds = routed.duration_to_destination_seconds or 0
 
-    # Главная база стоимости — время/расстояние до парковки.
-    # Остальные факторы — секунды штрафа/бонуса.
+    # В режиме маршрута к точке назначения пешая часть имеет повышенную цену:
+    # парковка в нескольких кварталах не должна выигрывать у парковки прямо у
+    # цели только благодаря десяткам избыточных свободных мест.
     base_cost = (
         float(routed.duration_from_origin_seconds)
-        + 0.55 * float(walk_seconds)
+        + DESTINATION_WALK_COST_MULTIPLIER * float(walk_seconds)
     )
 
     generalized_cost = (
@@ -1581,6 +1595,19 @@ def _apply_peer_availability_penalties(contexts: list[_CandidateContext]) -> Non
     for context in contexts:
         candidate = context.candidate
         penalty = 0.0
+
+        # Два надёжно доступных места уже образуют достаточный запас. Не
+        # штрафуем такую парковку у самой точки назначения только потому, что
+        # в нескольких кварталах есть гораздо более крупная парковка.
+        has_sufficient_destination_availability = (
+            candidate.duration_to_destination_seconds is not None
+            and candidate.current_free_count >= SUFFICIENT_FREE_SPACES
+            and context.effective_free_count >= SUFFICIENT_FREE_SPACES
+            and context.availability_probability >= 0.40
+        )
+
+        if has_sufficient_destination_availability:
+            continue
 
         for other in contexts:
             if other is context:

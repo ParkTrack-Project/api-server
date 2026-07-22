@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
 from sqlalchemy import bindparam, or_, text
 from sqlalchemy.orm import Session
 
@@ -19,6 +20,14 @@ from ..db_models import (
     User,
 )
 from ..dependencies import is_api_token_authenticated, require
+from ..services.snapshot_storage import (
+    SnapshotInvalidError,
+    SnapshotNotConfiguredError,
+    SnapshotNotFoundError,
+    SnapshotUnavailableError,
+    read_snapshot_from_metadata,
+    snapshot_reference_from_metadata,
+)
 from ..schemas.analytics import (
     AnalyticsSummary,
     ConfidencePoint,
@@ -45,6 +54,27 @@ from ..schemas.analytics import (
 )
 
 router = APIRouter(prefix="/admin/analytics", tags=["Admin Analytics"])
+
+SNAPSHOT_IMAGE_RESPONSES = {
+    200: {
+        "description": "Decrypted JPEG snapshot",
+        "content": {
+            "image/jpeg": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+    }
+}
+YOLO_LABELS_RESPONSES = {
+    200: {
+        "description": "Decrypted YOLOv12 detection labels",
+        "content": {
+            "text/plain": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+    }
+}
 
 
 GRANULARITY_SECONDS: dict[str, int] = {
@@ -527,6 +557,81 @@ def _ensure_detection_visible(db: Session, detection: OccupancyObservation, user
     )
 
 
+def _detection_camera_id(db: Session, detection: OccupancyObservation) -> int:
+    if detection.camera_id is not None:
+        return detection.camera_id
+    if detection.zone_id is not None:
+        zone = db.query(ParkingZone).filter(
+            ParkingZone.parking_zone_id == detection.zone_id
+        ).one_or_none()
+        if zone is not None:
+            return zone.camera_id
+    raise HTTPException(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={"error_description": "Detection run has no camera_id"},
+    )
+
+
+def _artifact_url(detection_run_id: int, variant: str) -> str:
+    base = f"/api/v1/admin/analytics/detections/{detection_run_id}"
+    if variant == "labels":
+        return f"{base}/labels"
+    return f"{base}/snapshot?variant={variant}"
+
+
+def _available_artifact_url(
+    metadata: dict[str, Any],
+    detection_run_id: int,
+    variant: str,
+) -> str | None:
+    if snapshot_reference_from_metadata(metadata, variant) is None:
+        return None
+    return _artifact_url(detection_run_id, variant)
+
+
+def _detection_artifact_response(
+    db: Session,
+    detection: OccupancyObservation,
+    variant: str,
+) -> Response:
+    camera_id = _detection_camera_id(db, detection)
+    try:
+        artifact = read_snapshot_from_metadata(
+            detection.metadata_json,
+            camera_id=camera_id,
+            variant=variant,
+        )
+    except SnapshotNotFoundError as exception:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Detection artifact not available"},
+        ) from exception
+    except (SnapshotNotConfiguredError, SnapshotUnavailableError) as exception:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_description": "Snapshot storage is unavailable"},
+        ) from exception
+    except SnapshotInvalidError as exception:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail={"error_description": "Detection artifact is invalid"},
+        ) from exception
+
+    disposition = "attachment" if variant == "labels" else "inline"
+    return Response(
+        content=artifact.content,
+        media_type=artifact.content_type,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{artifact.filename}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Detection-Run-Id": str(detection.observation_id),
+            "X-Snapshot-Captured-At": artifact.captured_at,
+            "X-Snapshot-Variant": variant,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Time and aggregation helpers
 # ---------------------------------------------------------------------------
@@ -800,8 +905,15 @@ def _serialize_detection_run(
         error_code=_to_str_or_none(_metadata_value(metadata, "error_code")),
         error_message=_to_str_or_none(_metadata_value(metadata, "error_message", "error")),
         has_feedback=observation.observation_id in feedback_ids,
-        raw_snapshot_url=_to_str_or_none(_metadata_value(metadata, "raw_snapshot_url", "snapshot_url")),
-        annotated_snapshot_url=_to_str_or_none(_metadata_value(metadata, "annotated_snapshot_url")),
+        raw_snapshot_url=_available_artifact_url(
+            metadata, observation.observation_id, "raw"
+        ),
+        annotated_snapshot_url=_available_artifact_url(
+            metadata, observation.observation_id, "annotated"
+        ),
+        yolo_labels_url=_available_artifact_url(
+            metadata, observation.observation_id, "labels"
+        ),
     )
 
 
@@ -1497,6 +1609,45 @@ def get_detection_run(
     feedback_ids = _feedback_run_ids(db, [detection.observation_id])
     zone_camera_ids = _zone_camera_map(db, {detection.zone_id})
     return _serialize_detection_run(db, detection, feedback_ids, zone_camera_ids)
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/analytics/detections/{detection_run_id}/snapshot
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/detections/{detection_run_id}/snapshot",
+    response_class=Response,
+    responses=SNAPSHOT_IMAGE_RESPONSES,
+)
+def get_detection_snapshot(
+    detection_run_id: int,
+    current_user: Annotated[User, require("analytics.view")],
+    db: Annotated[Session, Depends(get_db)],
+    variant: Literal["raw", "annotated"] = "raw",
+):
+    detection = _get_detection_or_404(db, detection_run_id)
+    _ensure_detection_visible(db, detection, current_user)
+    return _detection_artifact_response(db, detection, variant)
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/analytics/detections/{detection_run_id}/labels
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/detections/{detection_run_id}/labels",
+    response_class=Response,
+    responses=YOLO_LABELS_RESPONSES,
+)
+def get_detection_labels(
+    detection_run_id: int,
+    current_user: Annotated[User, require("analytics.view")],
+    db: Annotated[Session, Depends(get_db)],
+):
+    detection = _get_detection_or_404(db, detection_run_id)
+    _ensure_detection_visible(db, detection, current_user)
+    return _detection_artifact_response(db, detection, "labels")
 
 
 # ---------------------------------------------------------------------------

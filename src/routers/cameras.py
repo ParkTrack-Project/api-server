@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-import os
 from io import BytesIO
-from pathlib import Path
 from typing import Annotated
 
 import cv2
 import numpy as np
 import requests
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..db_models import Camera, DataSource, GlobalRole, Partner, User
+from ..db_models import Camera, DataSource, GlobalRole, OccupancyObservation, Partner, User
 from ..dependencies import require
+from ..services.snapshot_storage import (
+    SnapshotInvalidError,
+    SnapshotNotConfiguredError,
+    SnapshotNotFoundError,
+    SnapshotUnavailableError,
+    read_snapshot_from_metadata,
+    snapshot_reference_from_metadata,
+)
 from ..schemas.cameras import (
     CameraMapItemResponse,
     CameraNextResponse,
@@ -25,12 +32,15 @@ from ..schemas.cameras import (
 
 router = APIRouter(prefix="/cameras", tags=["Cameras"])
 
-
-SUPPORTED_SNAPSHOT_MEDIA_TYPES = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
+SNAPSHOT_IMAGE_RESPONSES = {
+    200: {
+        "description": "JPEG camera snapshot",
+        "content": {
+            "image/jpeg": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+    }
 }
 
 
@@ -420,7 +430,15 @@ def _encode_frame_to_jpeg_response(frame) -> StreamingResponse:
     out = BytesIO(buffer.tobytes())
     out.seek(0)
 
-    return StreamingResponse(out, media_type="image/jpeg")
+    return StreamingResponse(
+        out,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Snapshot-Variant": "raw",
+        },
+    )
 
 
 def _get_live_raw_snapshot_response(camera: Camera) -> StreamingResponse:
@@ -438,80 +456,88 @@ def _get_live_raw_snapshot_response(camera: Camera) -> StreamingResponse:
     return _encode_frame_to_jpeg_response(frame)
 
 
-def _get_first_existing_directory(env_names: tuple[str, ...]) -> Path | None:
-    for env_name in env_names:
-        directory = os.getenv(env_name)
-        if directory:
-            return Path(directory)
+def _stored_snapshot_response(
+    db: Session,
+    camera_id: int,
+    requested_variants: tuple[str, ...],
+    detection_run_id: int | None = None,
+) -> Response:
+    query = db.query(OccupancyObservation).filter(
+        OccupancyObservation.camera_id == camera_id
+    )
+    query = query.filter(or_(*[
+        OccupancyObservation.metadata_json["snapshots"].has_key(variant)  # noqa: W601
+        for variant in requested_variants
+    ]))
+    if detection_run_id is not None:
+        query = query.filter(OccupancyObservation.observation_id == detection_run_id)
 
-    return None
+    observations = query.order_by(
+        OccupancyObservation.observed_at.desc(),
+        OccupancyObservation.observation_id.desc(),
+    ).limit(1).all()
 
-
-def _find_snapshot_file(directory: Path, camera_id: int) -> tuple[Path, str] | None:
-    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
-        path = directory / f"{camera_id}{extension}"
-
-        if path.is_file():
-            return path, media_type
-
-    return None
-
-
-def _build_file_snapshot_response(path: Path, media_type: str) -> FileResponse:
-    return FileResponse(path, media_type=media_type)
-
-
-def _try_get_annotated_snapshot_response(camera_id: int) -> FileResponse | None:
-    directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
-
-    if directory is None:
-        return None
-
-    directory = Path(directory)
-
-    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
-        path = directory / f"{camera_id}{extension}"
-
-        if path.is_file():
-            return _build_file_snapshot_response(path, media_type)
-
-    return None
-
-
-def _get_last_detection_snapshot_response(camera_id: int) -> FileResponse:
-    directory = os.getenv("CAMERAS_IMAGES_DIRECTORY_PATH")
-
-    if directory is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error_description": "Last detection snapshots directory is not configured"},
-        )
-
-    directory = Path(directory)
-
-    found = None
-    for extension, media_type in SUPPORTED_SNAPSHOT_MEDIA_TYPES.items():
-        path = directory / f"{camera_id}_source{extension}"
-
-        if path.is_file():
-            found = path, media_type
+    selected: tuple[OccupancyObservation, str] | None = None
+    for observation in observations:
+        for variant in requested_variants:
+            if snapshot_reference_from_metadata(observation.metadata_json, variant) is not None:
+                selected = observation, variant
+                break
+        if selected is not None:
             break
 
-    if found is None:
+    if selected is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error_description": "Camera snapshot not available"},
         )
 
-    path, media_type = found
-    return _build_file_snapshot_response(path, media_type)
+    observation, variant = selected
+    try:
+        artifact = read_snapshot_from_metadata(
+            observation.metadata_json,
+            camera_id=camera_id,
+            variant=variant,
+        )
+    except SnapshotNotFoundError as exception:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_description": "Camera snapshot not available"},
+        ) from exception
+    except (SnapshotNotConfiguredError, SnapshotUnavailableError) as exception:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error_description": "Snapshot storage is unavailable"},
+        ) from exception
+    except SnapshotInvalidError as exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_description": "Camera snapshot is invalid"},
+        ) from exception
+
+    return Response(
+        content=artifact.content,
+        media_type=artifact.content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{artifact.filename}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Detection-Run-Id": str(observation.observation_id),
+            "X-Snapshot-Captured-At": artifact.captured_at,
+            "X-Snapshot-Variant": variant,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 # GET /cameras/{camera_id}/snapshot
 # ---------------------------------------------------------------------------
 
-@router.get("/{camera_id}/snapshot")
+@router.get(
+    "/{camera_id}/snapshot",
+    response_class=Response,
+    responses=SNAPSHOT_IMAGE_RESPONSES,
+)
 def get_snapshot(
     camera_id: int,
     current_user: Annotated[User, require("cameras.view")],
@@ -519,25 +545,26 @@ def get_snapshot(
     annotated: bool = False,
     last_detection: bool = False,
     fallback_to_raw: bool = False,
+    detection_run_id: int | None = Query(None, ge=1),
 ):
     camera = _get_camera_or_404(db, camera_id)
     _ensure_camera_visible(camera, current_user)
 
     if annotated:
-        # last_detection при annotated=true игнорируется.
-        annotated_response = _try_get_annotated_snapshot_response(camera_id)
-        if annotated_response is not None:
-            return annotated_response
-
-        if fallback_to_raw:
-            return _get_live_raw_snapshot_response(camera)
-
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error_description": "Camera snapshot not available"},
+        variants = ("annotated", "raw") if fallback_to_raw else ("annotated",)
+        return _stored_snapshot_response(
+            db,
+            camera_id,
+            variants,
+            detection_run_id=detection_run_id,
         )
 
-    if last_detection:
-        return _get_last_detection_snapshot_response(camera_id)
+    if last_detection or detection_run_id is not None:
+        return _stored_snapshot_response(
+            db,
+            camera_id,
+            ("raw",),
+            detection_run_id=detection_run_id,
+        )
 
     return _get_live_raw_snapshot_response(camera)

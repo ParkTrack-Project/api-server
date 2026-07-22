@@ -67,6 +67,9 @@ WALKING_DETOUR_FACTOR = 1.35
 # заставлять человека идти несколько кварталов ради избыточного запаса мест.
 SUFFICIENT_FREE_SPACES = 2
 DESTINATION_WALK_COST_MULTIPLIER = 2.5
+AVAILABILITY_BASE_COST_DISCOUNT = 0.20
+CLUSTER_BASE_COST_DISCOUNT = 0.10
+PROTECTED_DESTINATION_WALK_SECONDS = 2 * 60
 
 FORECAST_LOOKAROUND = timedelta(hours=2)
 
@@ -1341,25 +1344,28 @@ def _confidence_penalty_seconds(confidence: float) -> float:
 
 
 def _availability_bonus_seconds(
-    effective_free_count: int,
+    base_cost_seconds: float,
     availability_strength: float,
-    probability_free_space: float,
-    prioritize_destination: bool,
 ) -> float:
-    free_count_for_bonus = effective_free_count
-
-    if prioritize_destination:
-        free_count_for_bonus = min(free_count_for_bonus, SUFFICIENT_FREE_SPACES)
-
-    free_bonus = min(max(free_count_for_bonus - 1, 0) * 220.0, 900.0)
-    strength_bonus = availability_strength * 300.0
-    probability_bonus = probability_free_space * 220.0
-
-    return free_bonus + strength_bonus + probability_bonus
+    # Доступность может уменьшить стоимость пути, но не должна полностью
+    # перекрывать время поездки и пешего участка.
+    return (
+        max(base_cost_seconds, 0.0)
+        * AVAILABILITY_BASE_COST_DISCOUNT
+        * _clamp_float(availability_strength, 0.0, 1.0)
+    )
 
 
-def _cluster_bonus_seconds(cluster_strength: float) -> float:
-    return cluster_strength * 750.0
+def _cluster_bonus_seconds(
+    base_cost_seconds: float,
+    cluster_strength: float,
+) -> float:
+    # Наличие альтернатив рядом — страховка, а не замена основного маршрута.
+    return (
+        max(base_cost_seconds, 0.0)
+        * CLUSTER_BASE_COST_DISCOUNT
+        * _clamp_float(cluster_strength, 0.0, 1.0)
+    )
 
 
 def _candidate_reasons(
@@ -1387,9 +1393,9 @@ def _candidate_reasons(
         reasons.append("long_drive_time")
 
     if duration_to_destination_seconds is not None:
-        if duration_to_destination_seconds <= 5 * 60:
+        if duration_to_destination_seconds <= 2 * 60:
             reasons.append("very_close_to_destination_after_parking")
-        elif duration_to_destination_seconds <= 15 * 60:
+        elif duration_to_destination_seconds <= 8 * 60:
             reasons.append("acceptable_distance_to_destination_after_parking")
         else:
             reasons.append("far_from_destination_after_parking")
@@ -1488,15 +1494,6 @@ def _build_ranking_context(
     price_penalty = _price_penalty_seconds(pay)
     confidence_penalty = _confidence_penalty_seconds(effective_confidence)
 
-    availability_bonus = _availability_bonus_seconds(
-        effective_free_count=effective_free,
-        availability_strength=availability_strength,
-        probability_free_space=probability,
-        prioritize_destination=routed.duration_to_destination_seconds is not None,
-    )
-
-    cluster_bonus = _cluster_bonus_seconds(cluster.cluster_strength)
-
     walk_seconds = routed.duration_to_destination_seconds or 0
 
     # В режиме маршрута к точке назначения пешая часть имеет повышенную цену:
@@ -1505,6 +1502,15 @@ def _build_ranking_context(
     base_cost = (
         float(routed.duration_from_origin_seconds)
         + DESTINATION_WALK_COST_MULTIPLIER * float(walk_seconds)
+    )
+
+    availability_bonus = _availability_bonus_seconds(
+        base_cost_seconds=base_cost,
+        availability_strength=availability_strength,
+    )
+    cluster_bonus = _cluster_bonus_seconds(
+        base_cost_seconds=base_cost,
+        cluster_strength=cluster.cluster_strength,
     )
 
     generalized_cost = (
@@ -1601,6 +1607,8 @@ def _apply_peer_availability_penalties(contexts: list[_CandidateContext]) -> Non
         # в нескольких кварталах есть гораздо более крупная парковка.
         has_sufficient_destination_availability = (
             candidate.duration_to_destination_seconds is not None
+            and candidate.duration_to_destination_seconds
+            <= PROTECTED_DESTINATION_WALK_SECONDS
             and candidate.current_free_count >= SUFFICIENT_FREE_SPACES
             and context.effective_free_count >= SUFFICIENT_FREE_SPACES
             and context.availability_probability >= 0.40
@@ -1692,6 +1700,7 @@ def _ranking_sort_key(context: _CandidateContext) -> tuple[Any, ...]:
     return (
         poor_group,
         context.generalized_cost_seconds,
+        context.base_cost_seconds,
         -context.availability_strength,
         -context.cluster_metrics.cluster_strength,
         -context.effective_free_count,

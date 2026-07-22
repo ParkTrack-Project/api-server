@@ -404,6 +404,74 @@ class DestinationRankingTests(unittest.TestCase):
 
         self.assertEqual([candidate.zone_id for candidate in ranked], [2, 1])
 
+
+    def test_dominated_candidate_cannot_win_after_bonus_saturation(self) -> None:
+        arrival = datetime(2026, 7, 22, 17, 21, tzinfo=timezone.utc)
+        worse = _target(75, free=10, capacity=11)
+        better = _target(66, free=20, capacity=24)
+
+        forecasts = {
+            75: Forecast(
+                forecast_id=75,
+                zone_id=75,
+                predicted_for=arrival,
+                generated_at=arrival - timedelta(minutes=5),
+                capacity=11,
+                predicted_occupied=3,
+                probability_free_space=0.9888,
+                confidence=0.7776,
+                model_type="test",
+            ),
+            66: Forecast(
+                forecast_id=66,
+                zone_id=66,
+                predicted_for=arrival,
+                generated_at=arrival - timedelta(minutes=5),
+                capacity=24,
+                predicted_occupied=8,
+                probability_free_space=0.9965,
+                confidence=0.5452,
+                model_type="test",
+            ),
+        }
+        request_context = routing._RankingRequestContext(
+            forecasts_by_zone={
+                zone_id: routing._ForecastSeries(
+                    forecasts=[forecast],
+                    predicted_timestamps=[routing._datetime_timestamp(arrival)],
+                )
+                for zone_id, forecast in forecasts.items()
+            },
+            cluster_neighbors=routing._build_cluster_neighbors(
+                [worse, better], [worse, better]
+            ),
+            effective_state_cache={},
+        )
+
+        ranked = routing._finalize_contexts([
+            self._context(
+                worse,
+                drive_seconds=92,
+                walk_seconds=276,
+                request_context=request_context,
+                use_forecast=True,
+            ),
+            self._context(
+                better,
+                drive_seconds=59,
+                walk_seconds=86,
+                request_context=request_context,
+                use_forecast=True,
+            ),
+        ])
+
+        self.assertEqual([candidate.zone_id for candidate in ranked], [66, 75])
+        self.assertGreater(
+            ranked[1].ranking_explanation.generalized_cost_seconds,
+            ranked[0].ranking_explanation.generalized_cost_seconds,
+        )
+        self.assertNotEqual(ranked[0].score, ranked[1].score)
+
     def test_destination_priority_uses_availability_at_arrival(self) -> None:
         arrival = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
         near = _target(1, free=4, capacity=10)

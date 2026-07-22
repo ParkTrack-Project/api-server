@@ -1,4 +1,6 @@
 from __future__ import annotations
+from fastapi import Request
+from urllib.parse import urlencode
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -572,21 +574,41 @@ def _detection_camera_id(db: Session, detection: OccupancyObservation) -> int:
     )
 
 
-def _artifact_url(detection_run_id: int, variant: str) -> str:
-    base = f"/api/v1/admin/analytics/detections/{detection_run_id}"
+def _artifact_url(
+    request: Request,
+    detection_run_id: int,
+    variant: str,
+) -> str:
     if variant == "labels":
-        return f"{base}/labels"
-    return f"{base}/snapshot?variant={variant}"
+        return str(
+            request.url_for(
+                "get_detection_labels",
+                detection_run_id=detection_run_id,
+            )
+        )
+
+    return str(
+        request.url_for(
+            "get_detection_snapshot",
+            detection_run_id=detection_run_id,
+        ).include_query_params(variant=variant)
+    )
 
 
 def _available_artifact_url(
+    request: Request,
     metadata: dict[str, Any],
     detection_run_id: int,
     variant: str,
 ) -> str | None:
     if snapshot_reference_from_metadata(metadata, variant) is None:
         return None
-    return _artifact_url(detection_run_id, variant)
+
+    return _artifact_url(
+        request,
+        detection_run_id,
+        variant,
+    )
 
 
 def _detection_artifact_response(
@@ -852,6 +874,7 @@ def _detection_status(metadata: dict[str, Any]) -> str:
 
 
 def _serialize_detection_run(
+    request: Request,
     db: Session,
     observation: OccupancyObservation,
     feedback_ids: set[int],
@@ -906,13 +929,22 @@ def _serialize_detection_run(
         error_message=_to_str_or_none(_metadata_value(metadata, "error_message", "error")),
         has_feedback=observation.observation_id in feedback_ids,
         raw_snapshot_url=_available_artifact_url(
-            metadata, observation.observation_id, "raw"
+            request,
+            metadata,
+            observation.observation_id,
+            "raw",
         ),
         annotated_snapshot_url=_available_artifact_url(
-            metadata, observation.observation_id, "annotated"
+            request,
+            metadata,
+            observation.observation_id,
+            "annotated",
         ),
         yolo_labels_url=_available_artifact_url(
-            metadata, observation.observation_id, "labels"
+            request,
+            metadata,
+            observation.observation_id,
+            "labels",
         ),
     )
 
@@ -1540,9 +1572,13 @@ def get_detector_health(
 # GET /admin/analytics/cameras/{camera_id}/detections
 # ---------------------------------------------------------------------------
 
-@router.get("/cameras/{camera_id}/detections", response_model=DetectionRunListResponse)
+@router.get(
+    "/cameras/{camera_id}/detections",
+    response_model=DetectionRunListResponse,
+)
 def list_camera_detections(
     camera_id: int,
+    request: Request,
     current_user: Annotated[User, require("analytics.view")],
     db: Annotated[Session, Depends(get_db)],
     from_: datetime | None = Query(None, alias="from"),
@@ -1588,7 +1624,13 @@ def list_camera_detections(
 
     return DetectionRunListResponse(
         items=[
-            _serialize_detection_run(db, obs, feedback_ids, zone_camera_ids)
+            _serialize_detection_run(
+                request,
+                db,
+                obs,
+                feedback_ids,
+                zone_camera_ids,
+            )
             for obs in observations
         ]
     )
@@ -1601,14 +1643,29 @@ def list_camera_detections(
 @router.get("/detections/{detection_run_id}", response_model=DetectionRun)
 def get_detection_run(
     detection_run_id: int,
+    request: Request,
     current_user: Annotated[User, require("analytics.view")],
     db: Annotated[Session, Depends(get_db)],
 ):
     detection = _get_detection_or_404(db, detection_run_id)
     _ensure_detection_visible(db, detection, current_user)
-    feedback_ids = _feedback_run_ids(db, [detection.observation_id])
-    zone_camera_ids = _zone_camera_map(db, {detection.zone_id})
-    return _serialize_detection_run(db, detection, feedback_ids, zone_camera_ids)
+
+    feedback_ids = _feedback_run_ids(
+        db,
+        [detection.observation_id],
+    )
+    zone_camera_ids = _zone_camera_map(
+        db,
+        {detection.zone_id},
+    )
+
+    return _serialize_detection_run(
+        request,
+        db,
+        detection,
+        feedback_ids,
+        zone_camera_ids,
+    )
 
 
 # ---------------------------------------------------------------------------

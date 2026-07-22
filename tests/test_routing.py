@@ -36,8 +36,14 @@ class _Response:
         return self._payload
 
 
-def _target(zone_id: int, distance: int | None = None, free: int = 4):
+def _target(
+    zone_id: int,
+    distance: int | None = None,
+    free: int = 4,
+    capacity: int | None = None,
+):
     point = GeoPoint(latitude=55.75 + zone_id * 0.00005, longitude=37.61)
+    capacity = capacity if capacity is not None else max(10, free)
     zone = SimpleNamespace(
         parking_zone_id=zone_id,
         camera_id=None,
@@ -46,8 +52,8 @@ def _target(zone_id: int, distance: int | None = None, free: int = 4):
         location_type=None,
         is_accessible=False,
         pay=0,
-        capacity=10,
-        occupied=10 - free,
+        capacity=capacity,
+        occupied=capacity - free,
         confidence=0.9,
         occupancy_updated_at=datetime.now(timezone.utc),
     )
@@ -55,7 +61,7 @@ def _target(zone_id: int, distance: int | None = None, free: int = 4):
         zone=zone,
         point=point,
         anchor_distance_meters=distance if distance is not None else zone_id * 10,
-        current_occupied=10 - free,
+        current_occupied=capacity - free,
         current_free_count=free,
         current_confidence=0.9,
     )
@@ -290,6 +296,176 @@ class ForecastSelectionTests(unittest.TestCase):
         self.assertIn("partition by forecasts.zone_id, forecasts.predicted_for", sql)
         self.assertIn("forecasts.generated_at desc, forecasts.forecast_id desc", sql)
         self.assertIn("generation_rank", sql)
+
+
+class DestinationRankingTests(unittest.TestCase):
+    @staticmethod
+    def _context(
+        target,
+        *,
+        drive_seconds: int,
+        walk_seconds: int | None,
+        request_context: routing._RankingRequestContext,
+        use_forecast: bool = False,
+    ) -> routing._CandidateContext:
+        routed = routing._RoutedCandidate(
+            zone_target=target,
+            distance_from_origin_meters=drive_seconds * 8,
+            duration_from_origin_seconds=drive_seconds,
+            distance_to_destination_meters=walk_seconds,
+            duration_to_destination_seconds=walk_seconds,
+            arrival_time=datetime(2026, 1, 1, 12, tzinfo=timezone.utc),
+        )
+        return routing._build_ranking_context(
+            routed=routed,
+            request_context=request_context,
+            use_forecast=use_forecast,
+        )
+
+    @staticmethod
+    def _request_context(targets) -> routing._RankingRequestContext:
+        return routing._RankingRequestContext(
+            forecasts_by_zone={},
+            cluster_neighbors=routing._build_cluster_neighbors(targets, targets),
+            effective_state_cache={},
+        )
+
+    def test_four_spaces_at_destination_beat_twenty_spaces_five_minutes_away(self) -> None:
+        near = _target(1, free=4, capacity=10)
+        far = _target(2, free=20, capacity=30)
+        request_context = self._request_context([near, far])
+
+        ranked = routing._finalize_contexts([
+            self._context(
+                near,
+                drive_seconds=600,
+                walk_seconds=20,
+                request_context=request_context,
+            ),
+            self._context(
+                far,
+                drive_seconds=600,
+                walk_seconds=300,
+                request_context=request_context,
+            ),
+        ])
+
+        self.assertEqual([candidate.zone_id for candidate in ranked], [1, 2])
+        self.assertEqual(
+            ranked[0].ranking_explanation.peer_better_availability_penalty_seconds,
+            0.0,
+        )
+
+    def test_two_spaces_at_destination_beat_large_excess_supply_farther_away(self) -> None:
+        near = _target(1, free=2, capacity=10)
+        far = _target(2, free=100, capacity=120)
+        request_context = self._request_context([near, far])
+
+        ranked = routing._finalize_contexts([
+            self._context(
+                near,
+                drive_seconds=600,
+                walk_seconds=20,
+                request_context=request_context,
+            ),
+            self._context(
+                far,
+                drive_seconds=600,
+                walk_seconds=300,
+                request_context=request_context,
+            ),
+        ])
+
+        self.assertEqual([candidate.zone_id for candidate in ranked], [1, 2])
+
+    def test_single_space_at_destination_keeps_scarcity_risk(self) -> None:
+        near = _target(1, free=1, capacity=10)
+        far = _target(2, free=20, capacity=30)
+        request_context = routing._RankingRequestContext(
+            forecasts_by_zone={},
+            cluster_neighbors={},
+            effective_state_cache={},
+        )
+
+        ranked = routing._finalize_contexts([
+            self._context(
+                near,
+                drive_seconds=600,
+                walk_seconds=20,
+                request_context=request_context,
+            ),
+            self._context(
+                far,
+                drive_seconds=600,
+                walk_seconds=300,
+                request_context=request_context,
+            ),
+        ])
+
+        self.assertEqual([candidate.zone_id for candidate in ranked], [2, 1])
+
+    def test_destination_priority_uses_availability_at_arrival(self) -> None:
+        arrival = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        near = _target(1, free=4, capacity=10)
+        far = _target(2, free=100, capacity=120)
+
+        near_forecast = Forecast(
+            forecast_id=1,
+            zone_id=1,
+            predicted_for=arrival,
+            generated_at=arrival - timedelta(minutes=5),
+            capacity=10,
+            predicted_occupied=8,
+            probability_free_space=0.7,
+            confidence=0.9,
+            model_type="test",
+        )
+        far_forecast = Forecast(
+            forecast_id=2,
+            zone_id=2,
+            predicted_for=arrival,
+            generated_at=arrival - timedelta(minutes=5),
+            capacity=120,
+            predicted_occupied=20,
+            probability_free_space=0.99,
+            confidence=0.9,
+            model_type="test",
+        )
+
+        request_context = routing._RankingRequestContext(
+            forecasts_by_zone={
+                1: routing._ForecastSeries(
+                    forecasts=[near_forecast],
+                    predicted_timestamps=[routing._datetime_timestamp(arrival)],
+                ),
+                2: routing._ForecastSeries(
+                    forecasts=[far_forecast],
+                    predicted_timestamps=[routing._datetime_timestamp(arrival)],
+                ),
+            },
+            cluster_neighbors=routing._build_cluster_neighbors([near, far], [near, far]),
+            effective_state_cache={},
+        )
+
+        ranked = routing._finalize_contexts([
+            self._context(
+                near,
+                drive_seconds=600,
+                walk_seconds=20,
+                request_context=request_context,
+                use_forecast=True,
+            ),
+            self._context(
+                far,
+                drive_seconds=600,
+                walk_seconds=300,
+                request_context=request_context,
+                use_forecast=True,
+            ),
+        ])
+
+        self.assertEqual(ranked[0].zone_id, 1)
+        self.assertEqual(ranked[0].ranking_explanation.effective_free_count, 2)
 
 
 if __name__ == "__main__":

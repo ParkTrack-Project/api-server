@@ -533,7 +533,12 @@ def _stored_snapshot_response(
 # GET /cameras/{camera_id}/snapshot
 # ---------------------------------------------------------------------------
 
-def _legacy_get_snapshot(
+@router.get(
+    "/{camera_id}/snapshot",
+    response_class=Response,
+    responses=SNAPSHOT_IMAGE_RESPONSES,
+)
+def get_camera_snapshot(
     camera_id: int,
     current_user: Annotated[User, require("cameras.view")],
     db: Annotated[Session, Depends(get_db)],

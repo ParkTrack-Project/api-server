@@ -4,7 +4,8 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text, func
+from sqlalchemy import func, text
+from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -25,12 +26,10 @@ router = APIRouter(prefix="/forecasts", tags=["Forecasts"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _predicted_free_count(f: Forecast, db: Session) -> int:
-    row = db.execute(
-        text("SELECT predicted_free_count FROM forecasts WHERE forecast_id = :id"),
-        {"id": f.forecast_id},
-    ).one_or_none()
-    return row[0] if row else (f.capacity - f.predicted_occupied)
+def _predicted_free_count(f: Forecast) -> int:
+    # The database column is generated from the same expression. Computing it
+    # from the already loaded values avoids one extra SELECT per forecast.
+    return f.capacity - f.predicted_occupied
 
 
 def _confidence_level(confidence: float) -> ConfidenceLevel | None:
@@ -44,7 +43,7 @@ def _confidence_level(confidence: float) -> ConfidenceLevel | None:
         return ConfidenceLevel.very_low
 
 
-def _serialize(f: Forecast, db: Session) -> ForecastPointResponse:
+def _serialize(f: Forecast) -> ForecastPointResponse:
     return ForecastPointResponse(
         forecast_id=f.forecast_id,
         zone_id=f.zone_id,
@@ -56,7 +55,7 @@ def _serialize(f: Forecast, db: Session) -> ForecastPointResponse:
         predicted_for=f.predicted_for,
         capacity=f.capacity,
         predicted_occupied=f.predicted_occupied,
-        predicted_free_count=_predicted_free_count(f, db),
+        predicted_free_count=_predicted_free_count(f),
         probability_free_space=f.probability_free_space,
         confidence=f.confidence,
         confidence_level=f.confidence_level.value if f.confidence_level else None,
@@ -80,6 +79,181 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
     except ValueError:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail={"error_description": "bbox must be min_lon,min_lat,max_lon,max_lat"})
+
+
+def _map_forecasts_statement(
+    *,
+    at: datetime,
+    zone_id: int | None,
+    camera_id: int | None,
+    partner_id: int | None,
+    model_type: str | None,
+    generated_from: datetime | None,
+    generated_to: datetime | None,
+    from_: datetime | None,
+    to: datetime | None,
+    bbox: tuple[float, float, float, float] | None,
+    is_active: bool | None,
+) -> tuple[TextClause, dict[str, object]]:
+    """
+    Build the map query around bounded index lookups.
+
+    For every matching zone the two lateral branches read at most one candidate:
+    the nearest timestamp before ``at`` and the nearest timestamp at/after it.
+    The outer lateral query applies the same tie-breakers as the former global
+    ROW_NUMBER query. The composite index created by migration 000018 supports
+    these lookups by ``zone_id`` and ``predicted_for``.
+    """
+    params: dict[str, object] = {"at": at}
+    forecast_filters = ["f.zone_id = z.parking_zone_id"]
+    zone_filters: list[str] = []
+
+    optional_forecast_filters = (
+        ("camera_id", camera_id, "f.camera_id = :camera_id"),
+        ("partner_id", partner_id, "f.partner_id = :partner_id"),
+        ("model_type", model_type, "f.model_type = :model_type"),
+        ("generated_from", generated_from, "f.generated_at >= :generated_from"),
+        ("generated_to", generated_to, "f.generated_at <= :generated_to"),
+        ("from_", from_, "f.predicted_for >= :from_"),
+        ("to", to, "f.predicted_for <= :to"),
+    )
+
+    for name, value, clause in optional_forecast_filters:
+        if value is not None:
+            params[name] = value
+            forecast_filters.append(clause)
+
+    if zone_id is not None:
+        params["zone_id"] = zone_id
+        zone_filters.append("z.parking_zone_id = :zone_id")
+
+    if is_active is True:
+        zone_filters.append("z.is_active IS TRUE")
+    elif is_active is False:
+        zone_filters.append("z.is_active IS FALSE")
+
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        params.update(
+            {
+                "min_lon": min_lon,
+                "min_lat": min_lat,
+                "max_lon": max_lon,
+                "max_lat": max_lat,
+            }
+        )
+        zone_filters.extend(
+            (
+                "z.centroid_longitude >= :min_lon",
+                "z.centroid_longitude <= :max_lon",
+                "z.centroid_latitude >= :min_lat",
+                "z.centroid_latitude <= :max_lat",
+            )
+        )
+
+    forecast_where = "\n                    AND ".join(forecast_filters)
+    zone_where = "\n        AND ".join(zone_filters) if zone_filters else "TRUE"
+
+    statement = text(
+        f"""
+        SELECT
+            z.parking_zone_id AS zone_id,
+            f.camera_id,
+            f.capacity,
+            f.predicted_occupied,
+            f.predicted_free_count,
+            f.probability_free_space,
+            f.confidence,
+            CAST(f.confidence_level AS TEXT) AS confidence_level,
+            f.predicted_for,
+            f.generated_at,
+            z.geometry,
+            z.pay,
+            CAST(z.zone_type AS TEXT) AS zone_type,
+            CAST(z.location_type AS TEXT) AS location_type,
+            z.is_accessible,
+            z.is_active
+        FROM parking_zones AS z
+        CROSS JOIN LATERAL (
+            SELECT candidate.forecast_id
+            FROM (
+                (
+                    SELECT
+                        f.forecast_id,
+                        f.predicted_for,
+                        f.generated_at
+                    FROM forecasts AS f
+                    WHERE {forecast_where}
+                      AND f.predicted_for >= :at
+                    ORDER BY
+                        f.predicted_for ASC,
+                        f.generated_at DESC,
+                        f.forecast_id DESC
+                    LIMIT 1
+                )
+                UNION ALL
+                (
+                    SELECT
+                        f.forecast_id,
+                        f.predicted_for,
+                        f.generated_at
+                    FROM forecasts AS f
+                    WHERE {forecast_where}
+                      AND f.predicted_for < :at
+                    ORDER BY
+                        f.predicted_for DESC,
+                        f.generated_at DESC,
+                        f.forecast_id DESC
+                    LIMIT 1
+                )
+            ) AS candidate
+            ORDER BY
+                ABS(EXTRACT(EPOCH FROM candidate.predicted_for - :at)) ASC,
+                candidate.generated_at DESC,
+                candidate.forecast_id DESC
+            LIMIT 1
+        ) AS nearest
+        JOIN forecasts AS f ON f.forecast_id = nearest.forecast_id
+        WHERE {zone_where}
+        ORDER BY f.predicted_for ASC, z.parking_zone_id ASC
+        """
+    )
+
+    return statement, params
+
+
+def _list_map_forecasts(
+    *,
+    db: Session,
+    at: datetime,
+    zone_id: int | None,
+    camera_id: int | None,
+    partner_id: int | None,
+    model_type: str | None,
+    generated_from: datetime | None,
+    generated_to: datetime | None,
+    from_: datetime | None,
+    to: datetime | None,
+    bbox: str | None,
+    is_active: bool | None,
+) -> list[ForecastMapItem]:
+    bbox_bounds = _parse_bbox(bbox) if bbox is not None else None
+    statement, params = _map_forecasts_statement(
+        at=at,
+        zone_id=zone_id,
+        camera_id=camera_id,
+        partner_id=partner_id,
+        model_type=model_type,
+        generated_from=generated_from,
+        generated_to=generated_to,
+        from_=from_,
+        to=to,
+        bbox=bbox_bounds,
+        is_active=is_active,
+    )
+    rows = db.execute(statement, params).mappings().all()
+
+    return [ForecastMapItem(**row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +280,28 @@ def list_forecasts(
     at:                datetime | None = None,
     latest_model_only: bool          = False,
     bbox:              str    | None = None,
+    is_active:         bool   | None = None,
     view:              str           = "points",
 ):
     if view == "map" and at is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                             detail={"error_description": "Parameter 'at' is required for view=map"})
+
+    if view == "map":
+        return _list_map_forecasts(
+            db=db,
+            at=at,
+            zone_id=zone_id,
+            camera_id=camera_id,
+            partner_id=partner_id,
+            model_type=model_type,
+            generated_from=generated_from,
+            generated_to=generated_to,
+            from_=from_,
+            to=to,
+            bbox=bbox,
+            is_active=is_active,
+        )
 
     query = db.query(Forecast)
 
@@ -130,6 +321,11 @@ def list_forecasts(
         query = query.filter(Forecast.predicted_for >= from_)
     if to:
         query = query.filter(Forecast.predicted_for <= to)
+    if is_active is not None:
+        query = query.join(
+            ParkingZone,
+            ParkingZone.parking_zone_id == Forecast.zone_id,
+        ).filter(ParkingZone.is_active == is_active)
 
     # Если указан at, независимо от view возвращаем по одному прогнозу на каждую зону.
     # Логика:
@@ -183,27 +379,6 @@ def list_forecasts(
             & (Forecast.generated_at == latest_sq.c.max_gen),
         )
 
-    # bbox имеет смысл только для карты, но теперь он не должен быть связан
-    # с выбором одного прогноза по at.
-    if view == "map" and bbox:
-        min_lon, min_lat, max_lon, max_lat = _parse_bbox(bbox)
-
-        zone_ids_in_bbox = []
-        zones = db.query(ParkingZone).all()
-
-        for z in zones:
-            try:
-                coords = z.geometry["coordinates"][0]
-                z_lon = sum(c[0] for c in coords) / len(coords)
-                z_lat = sum(c[1] for c in coords) / len(coords)
-
-                if min_lon <= z_lon <= max_lon and min_lat <= z_lat <= max_lat:
-                    zone_ids_in_bbox.append(z.parking_zone_id)
-            except Exception:
-                pass
-
-        query = query.filter(Forecast.zone_id.in_(zone_ids_in_bbox))
-
     forecasts = query.order_by(Forecast.predicted_for.asc()).all()
 
     if view == "series":
@@ -211,7 +386,7 @@ def list_forecasts(
             ForecastSeriesPoint(
                 predicted_for=f.predicted_for,
                 predicted_occupied=f.predicted_occupied,
-                predicted_free_count=_predicted_free_count(f, db),
+                predicted_free_count=_predicted_free_count(f),
                 capacity=f.capacity,
                 probability_free_space=f.probability_free_space,
                 confidence=f.confidence,
@@ -222,36 +397,8 @@ def list_forecasts(
             for f in forecasts
         ]
 
-    if view == "map":
-        result = []
-        for f in forecasts:
-            zone = db.query(ParkingZone).filter(
-                ParkingZone.parking_zone_id == f.zone_id
-            ).one_or_none()
-            if zone is None:
-                continue
-            result.append(ForecastMapItem(
-                zone_id=f.zone_id,
-                camera_id=f.camera_id,
-                capacity=f.capacity,
-                predicted_occupied=f.predicted_occupied,
-                predicted_free_count=_predicted_free_count(f, db),
-                probability_free_space=f.probability_free_space,
-                confidence=f.confidence,
-                confidence_level=f.confidence_level.value if f.confidence_level else None,
-                predicted_for=f.predicted_for,
-                generated_at=f.generated_at,
-                geometry=zone.geometry,
-                pay=zone.pay,
-                zone_type=zone.zone_type.value,
-                location_type=zone.location_type.value if zone.location_type else None,
-                is_accessible=zone.is_accessible,
-                is_active=zone.is_active,
-            ))
-        return result
-
     # view=points (default)
-    return [_serialize(f, db) for f in forecasts]
+    return [_serialize(f) for f in forecasts]
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +465,7 @@ def get_forecast(
     current_user: Annotated[User, require("forecasts.view")],
     db:           Annotated[Session, Depends(get_db)],
 ):
-    return _serialize(_get_forecast_or_404(db, forecast_id), db)
+    return _serialize(_get_forecast_or_404(db, forecast_id))
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +508,7 @@ def update_forecast(
 
     db.commit()
     db.refresh(f)
-    return _serialize(f, db)
+    return _serialize(f)
 
 
 # ---------------------------------------------------------------------------

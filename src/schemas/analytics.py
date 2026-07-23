@@ -151,6 +151,9 @@ class DetectionRun(BaseModel):
     error_code: str | None
     error_message: str | None
     has_feedback: bool
+    raw_snapshot_url: str | None
+    annotated_snapshot_url: str | None
+    yolo_labels_url: str | None
 
 
 class DetectionRunListResponse(BaseModel):

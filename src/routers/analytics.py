@@ -527,6 +527,25 @@ def _ensure_detection_visible(db: Session, detection: OccupancyObservation, user
     )
 
 
+def _available_artifact_url(
+    metadata: dict[str, Any],
+    variant: str,
+) -> str | None:
+    snapshots = metadata.get("snapshots")
+    if not isinstance(snapshots, dict):
+        return None
+
+    artifact = snapshots.get(variant)
+    if not isinstance(artifact, dict):
+        return None
+
+    url = artifact.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+
+    return url
+
+
 # ---------------------------------------------------------------------------
 # Time and aggregation helpers
 # ---------------------------------------------------------------------------
@@ -800,6 +819,9 @@ def _serialize_detection_run(
         error_code=_to_str_or_none(_metadata_value(metadata, "error_code")),
         error_message=_to_str_or_none(_metadata_value(metadata, "error_message", "error")),
         has_feedback=observation.observation_id in feedback_ids,
+        raw_snapshot_url=_available_artifact_url(metadata, "raw"),
+        annotated_snapshot_url=_available_artifact_url(metadata, "annotated"),
+        yolo_labels_url=_available_artifact_url(metadata, "labels"),
     )
 
 

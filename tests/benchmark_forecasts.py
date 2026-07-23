@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import URL, create_engine, text
+from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -47,6 +48,23 @@ def _explain_ms(connection, statement, params: dict[str, object]) -> tuple[float
         + statement.text
     )
     document = connection.execute(explain, params).scalar_one()
+    root = document[0]
+    indexes = {
+        node["Index Name"]
+        for node in _plan_nodes(root["Plan"])
+        if "Index Name" in node
+    }
+    return float(root["Execution Time"]), indexes
+
+
+def _explain_select_ms(connection, statement) -> tuple[float, set[str]]:
+    compiled = statement.compile(
+        dialect=connection.dialect,
+        compile_kwargs={"literal_binds": True},
+    )
+    document = connection.execute(
+        text("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + str(compiled))
+    ).scalar_one()
     root = document[0]
     indexes = {
         node["Index Name"]
@@ -89,6 +107,7 @@ def main() -> None:
                         camera_id INTEGER,
                         partner_id INTEGER,
                         model_type TEXT NOT NULL,
+                        model_version TEXT,
                         generated_at TIMESTAMPTZ NOT NULL,
                         predicted_for TIMESTAMPTZ NOT NULL,
                         capacity INTEGER NOT NULL,
@@ -98,7 +117,9 @@ def main() -> None:
                         ) STORED,
                         probability_free_space DOUBLE PRECISION NOT NULL,
                         confidence DOUBLE PRECISION NOT NULL,
-                        confidence_level TEXT
+                        confidence_level TEXT,
+                        metadata JSONB,
+                        created_by_user_id INTEGER
                     ) ON COMMIT DROP
                     """
                 )
@@ -167,22 +188,37 @@ def main() -> None:
                         confidence_level
                     )
                     SELECT
-                        ((item - 1) % 75) + 1,
+                        zone_id,
                         1,
                         1,
                         'baseline',
-                        TIMESTAMPTZ '2026-07-01 00:00:00+00',
-                        TIMESTAMPTZ '2026-07-15 00:00:00+00'
-                            + ((item - 1) / 75) * INTERVAL '1 minute',
+                        TIMESTAMPTZ '2026-07-01 00:00:00+00'
+                            + (sequence_number / 288) * INTERVAL '6 hours',
+                        TIMESTAMPTZ '2026-07-23 00:00:00+00'
+                            + (sequence_number % 288) * INTERVAL '5 minutes',
                         10,
                         item % 10,
                         0.8,
                         0.9,
                         'high'
-                    FROM generate_series(1, :row_count) AS item
+                    FROM (
+                        SELECT
+                            item,
+                            ((item - 1) % 75) + 1 AS zone_id,
+                            (item - 1) / 75 AS sequence_number
+                        FROM generate_series(1, :row_count) AS item
+                    ) AS generated_points
                     """
                 ),
                 {"row_count": row_count},
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX uq_forecast_point
+                    ON forecasts (zone_id, generated_at, predicted_for)
+                    """
+                )
             )
             connection.execute(
                 text(
@@ -236,20 +272,67 @@ def main() -> None:
                 to=None,
                 bbox=BBOX,
                 is_active=True,
+                latest_model_only=False,
+            )
+            latest_statement, latest_params = forecasts._map_forecasts_statement(
+                at=AT,
+                zone_id=None,
+                camera_id=None,
+                partner_id=None,
+                model_type=None,
+                generated_from=None,
+                generated_to=None,
+                from_=None,
+                to=None,
+                bbox=BBOX,
+                is_active=True,
+                latest_model_only=True,
             )
 
             old_ms, _ = _explain_ms(connection, old_statement, {"at": AT})
             new_ms, indexes = _explain_ms(connection, new_statement, params)
+            latest_ms, latest_indexes = _explain_ms(
+                connection,
+                latest_statement,
+                latest_params,
+            )
+            latest_series_query = forecasts._latest_generation_query(
+                db=Session(bind=connection),
+                zone_id=None,
+                camera_id=None,
+                partner_id=None,
+                model_type=None,
+                generated_from=None,
+                generated_to=None,
+                from_=None,
+                to=None,
+                bbox=BBOX,
+                is_active=True,
+            )
+            latest_series_ms, latest_series_indexes = _explain_select_ms(
+                connection,
+                latest_series_query.statement,
+            )
             rows = connection.execute(new_statement, params).mappings().all()
+            latest_rows = (
+                connection.execute(latest_statement, latest_params)
+                .mappings()
+                .all()
+            )
+            latest_series_rows = latest_series_query.all()
 
             if len(rows) != 26:
                 raise AssertionError(f"expected 26 active map zones, got {len(rows)}")
+            if len(latest_rows) != 26:
+                raise AssertionError(
+                    f"expected 26 latest-model map zones, got {len(latest_rows)}"
+                )
             expected_time = datetime(
                 2026,
                 7,
                 23,
                 16,
-                33,
+                35,
                 tzinfo=timezone.utc,
             )
             if any(row["predicted_for"] != expected_time for row in rows):
@@ -258,12 +341,49 @@ def main() -> None:
                 raise AssertionError(f"forecast lookup index was not used: {sorted(indexes)}")
             if new_ms >= 2_000:
                 raise AssertionError(f"optimized query exceeded 2 seconds: {new_ms:.3f} ms")
+            if "uq_forecast_point" not in latest_indexes:
+                raise AssertionError(
+                    "latest-generation index was not used: "
+                    f"{sorted(latest_indexes)}"
+                )
+            if latest_ms >= 2_000:
+                raise AssertionError(
+                    "latest-model query exceeded 2 seconds: "
+                    f"{latest_ms:.3f} ms"
+                )
+            generations_by_zone: dict[int, set[datetime]] = {}
+            for forecast in latest_series_rows:
+                generations_by_zone.setdefault(forecast.zone_id, set()).add(
+                    forecast.generated_at
+                )
+            if len(generations_by_zone) != 26:
+                raise AssertionError(
+                    "expected latest series for 26 active zones, got "
+                    f"{len(generations_by_zone)}"
+                )
+            if any(len(generations) != 1 for generations in generations_by_zone.values()):
+                raise AssertionError("latest series contains multiple generations")
+            if len(latest_series_rows) > 26 * 288:
+                raise AssertionError("latest series returned more than one horizon per zone")
+            if "uq_forecast_point" not in latest_series_indexes:
+                raise AssertionError(
+                    "latest-series index was not used: "
+                    f"{sorted(latest_series_indexes)}"
+                )
+            if latest_series_ms >= 2_000:
+                raise AssertionError(
+                    "latest-series query exceeded 2 seconds: "
+                    f"{latest_series_ms:.3f} ms"
+                )
 
             print(
                 "forecast_map "
                 f"rows={row_count} result_zones={len(rows)} "
                 f"seed_seconds={seed_seconds:.3f} "
                 f"old_ms={old_ms:.3f} new_ms={new_ms:.3f} "
+                f"latest_ms={latest_ms:.3f} "
+                f"latest_series_rows={len(latest_series_rows)} "
+                f"latest_series_ms={latest_series_ms:.3f} "
                 f"speedup={old_ms / new_ms:.1f}x"
             )
         finally:

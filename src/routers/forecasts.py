@@ -4,9 +4,9 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, text
+from sqlalchemy import func, select, text, true
 from sqlalchemy.sql.elements import TextClause
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ..database import get_db
 from ..db_models import ConfidenceLevel, Forecast, ParkingZone, User
@@ -81,6 +81,121 @@ def _parse_bbox(bbox: str) -> tuple[float, float, float, float]:
                             detail={"error_description": "bbox must be min_lon,min_lat,max_lon,max_lat"})
 
 
+def _apply_forecast_filters(
+    query,
+    forecast,
+    *,
+    camera_id: int | None,
+    partner_id: int | None,
+    model_type: str | None,
+    generated_from: datetime | None,
+    generated_to: datetime | None,
+    from_: datetime | None,
+    to: datetime | None,
+):
+    if camera_id is not None:
+        query = query.filter(forecast.camera_id == camera_id)
+    if partner_id is not None:
+        query = query.filter(forecast.partner_id == partner_id)
+    if model_type is not None:
+        query = query.filter(forecast.model_type == model_type)
+    if generated_from is not None:
+        query = query.filter(forecast.generated_at >= generated_from)
+    if generated_to is not None:
+        query = query.filter(forecast.generated_at <= generated_to)
+    if from_ is not None:
+        query = query.filter(forecast.predicted_for >= from_)
+    if to is not None:
+        query = query.filter(forecast.predicted_for <= to)
+    return query
+
+
+def _latest_generation_query(
+    *,
+    db: Session,
+    zone_id: int | None,
+    camera_id: int | None,
+    partner_id: int | None,
+    model_type: str | None,
+    generated_from: datetime | None,
+    generated_to: datetime | None,
+    from_: datetime | None,
+    to: datetime | None,
+    bbox: tuple[float, float, float, float] | None,
+    is_active: bool | None,
+):
+    """
+    Return only points from the latest matching generation in each zone.
+
+    Starting from the much smaller parking_zones table lets PostgreSQL perform
+    one bounded index lookup per zone instead of grouping or sorting the entire
+    forecasts table. The uq_forecast_point index starts with
+    (zone_id, generated_at), so ORDER BY generated_at DESC LIMIT 1 is an
+    index-backed lookup.
+    """
+    zones = select(ParkingZone.parking_zone_id.label("zone_id"))
+
+    if zone_id is not None:
+        zones = zones.filter(ParkingZone.parking_zone_id == zone_id)
+    if is_active is not None:
+        zones = zones.filter(ParkingZone.is_active == is_active)
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        zones = zones.filter(
+            ParkingZone.centroid_longitude >= min_lon,
+            ParkingZone.centroid_longitude <= max_lon,
+            ParkingZone.centroid_latitude >= min_lat,
+            ParkingZone.centroid_latitude <= max_lat,
+        )
+
+    matching_zones = zones.subquery("matching_zones")
+    generation_candidate = aliased(Forecast, name="generation_candidate")
+    latest_generation = select(
+        generation_candidate.generated_at.label("generated_at")
+    ).filter(
+        generation_candidate.zone_id == matching_zones.c.zone_id
+    )
+    latest_generation = _apply_forecast_filters(
+        latest_generation,
+        generation_candidate,
+        camera_id=camera_id,
+        partner_id=partner_id,
+        model_type=model_type,
+        generated_from=generated_from,
+        generated_to=generated_to,
+        from_=from_,
+        to=to,
+    )
+    latest_generation = (
+        latest_generation
+        .order_by(generation_candidate.generated_at.desc())
+        .limit(1)
+        .lateral("latest_generation")
+    )
+
+    query = (
+        db.query(Forecast)
+        .select_from(matching_zones)
+        .join(latest_generation, true())
+        .join(
+            Forecast,
+            (Forecast.zone_id == matching_zones.c.zone_id)
+            & (Forecast.generated_at == latest_generation.c.generated_at),
+        )
+    )
+    return _apply_forecast_filters(
+        query,
+        Forecast,
+        camera_id=camera_id,
+        partner_id=partner_id,
+        model_type=model_type,
+        generated_from=generated_from,
+        generated_to=generated_to,
+        from_=from_,
+        to=to,
+    )
+
+
 def _map_forecasts_statement(
     *,
     at: datetime,
@@ -94,6 +209,7 @@ def _map_forecasts_statement(
     to: datetime | None,
     bbox: tuple[float, float, float, float] | None,
     is_active: bool | None,
+    latest_model_only: bool,
 ) -> tuple[TextClause, dict[str, object]]:
     """
     Build the map query around bounded index lookups.
@@ -151,6 +267,26 @@ def _map_forecasts_statement(
             )
         )
 
+    latest_generation_join = ""
+    if latest_model_only:
+        latest_filters = [
+            clause.replace("f.", "generation_candidate.")
+            for clause in forecast_filters
+        ]
+        latest_where = "\n                AND ".join(latest_filters)
+        latest_generation_join = f"""
+        CROSS JOIN LATERAL (
+            SELECT generation_candidate.generated_at
+            FROM forecasts AS generation_candidate
+            WHERE {latest_where}
+            ORDER BY generation_candidate.generated_at DESC
+            LIMIT 1
+        ) AS latest_generation
+        """
+        forecast_filters.append(
+            "f.generated_at = latest_generation.generated_at"
+        )
+
     forecast_where = "\n                    AND ".join(forecast_filters)
     zone_where = "\n        AND ".join(zone_filters) if zone_filters else "TRUE"
 
@@ -174,6 +310,7 @@ def _map_forecasts_statement(
             z.is_accessible,
             z.is_active
         FROM parking_zones AS z
+        {latest_generation_join}
         CROSS JOIN LATERAL (
             SELECT candidate.forecast_id
             FROM (
@@ -236,6 +373,7 @@ def _list_map_forecasts(
     to: datetime | None,
     bbox: str | None,
     is_active: bool | None,
+    latest_model_only: bool,
 ) -> list[ForecastMapItem]:
     bbox_bounds = _parse_bbox(bbox) if bbox is not None else None
     statement, params = _map_forecasts_statement(
@@ -250,6 +388,7 @@ def _list_map_forecasts(
         to=to,
         bbox=bbox_bounds,
         is_active=is_active,
+        latest_model_only=latest_model_only,
     )
     rows = db.execute(statement, params).mappings().all()
 
@@ -301,31 +440,56 @@ def list_forecasts(
             to=to,
             bbox=bbox,
             is_active=is_active,
+            latest_model_only=latest_model_only,
         )
 
-    query = db.query(Forecast)
+    bbox_bounds = _parse_bbox(bbox) if bbox is not None else None
 
-    if zone_id is not None:
-        query = query.filter(Forecast.zone_id == zone_id)
-    if camera_id is not None:
-        query = query.filter(Forecast.camera_id == camera_id)
-    if partner_id is not None:
-        query = query.filter(Forecast.partner_id == partner_id)
-    if model_type is not None:
-        query = query.filter(Forecast.model_type == model_type)
-    if generated_from:
-        query = query.filter(Forecast.generated_at >= generated_from)
-    if generated_to:
-        query = query.filter(Forecast.generated_at <= generated_to)
-    if from_:
-        query = query.filter(Forecast.predicted_for >= from_)
-    if to:
-        query = query.filter(Forecast.predicted_for <= to)
-    if is_active is not None:
+    if latest_model_only:
+        query = _latest_generation_query(
+            db=db,
+            zone_id=zone_id,
+            camera_id=camera_id,
+            partner_id=partner_id,
+            model_type=model_type,
+            generated_from=generated_from,
+            generated_to=generated_to,
+            from_=from_,
+            to=to,
+            bbox=bbox_bounds,
+            is_active=is_active,
+        )
+    else:
+        query = db.query(Forecast)
+        if zone_id is not None:
+            query = query.filter(Forecast.zone_id == zone_id)
+        query = _apply_forecast_filters(
+            query,
+            Forecast,
+            camera_id=camera_id,
+            partner_id=partner_id,
+            model_type=model_type,
+            generated_from=generated_from,
+            generated_to=generated_to,
+            from_=from_,
+            to=to,
+        )
+
+    if not latest_model_only and (is_active is not None or bbox_bounds is not None):
         query = query.join(
             ParkingZone,
             ParkingZone.parking_zone_id == Forecast.zone_id,
-        ).filter(ParkingZone.is_active == is_active)
+        )
+        if is_active is not None:
+            query = query.filter(ParkingZone.is_active == is_active)
+        if bbox_bounds is not None:
+            min_lon, min_lat, max_lon, max_lat = bbox_bounds
+            query = query.filter(
+                ParkingZone.centroid_longitude >= min_lon,
+                ParkingZone.centroid_longitude <= max_lon,
+                ParkingZone.centroid_latitude >= min_lat,
+                ParkingZone.centroid_latitude <= max_lat,
+            )
 
     # Если указан at, независимо от view возвращаем по одному прогнозу на каждую зону.
     # Логика:
@@ -357,26 +521,6 @@ def list_forecasts(
             db.query(Forecast)
             .join(ranked_sq, Forecast.forecast_id == ranked_sq.c.forecast_id)
             .filter(ranked_sq.c.rn == 1)
-        )
-
-    # Если at не указан, но requested latest_model_only,
-    # оставляем старую логику: последняя генерация по каждой зоне + predicted_for.
-    elif latest_model_only:
-        latest_sq = (
-            query.with_entities(
-                Forecast.zone_id.label("zone_id"),
-                Forecast.predicted_for.label("predicted_for"),
-                func.max(Forecast.generated_at).label("max_gen"),
-            )
-            .group_by(Forecast.zone_id, Forecast.predicted_for)
-            .subquery()
-        )
-
-        query = query.join(
-            latest_sq,
-            (Forecast.zone_id == latest_sq.c.zone_id)
-            & (Forecast.predicted_for == latest_sq.c.predicted_for)
-            & (Forecast.generated_at == latest_sq.c.max_gen),
         )
 
     forecasts = query.order_by(Forecast.predicted_for.asc()).all()

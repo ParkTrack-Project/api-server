@@ -7,6 +7,10 @@ from typing import Any
 
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
+from sqlalchemy import create_mock_engine  # noqa: E402
+from sqlalchemy.dialects import postgresql  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
 from src.db_models import Forecast  # noqa: E402
 from src.routers import forecasts  # noqa: E402
 
@@ -67,6 +71,7 @@ def _statement(
         "to": None,
         "bbox": None,
         "is_active": None,
+        "latest_model_only": False,
     }
     arguments.update(overrides)
     return forecasts._map_forecasts_statement(**arguments)
@@ -77,6 +82,7 @@ class ForecastMapStatementTests(unittest.TestCase):
         statement, params = _statement(
             bbox=(34.3471, 61.78765, 34.36887, 61.79272),
             is_active=True,
+            latest_model_only=False,
         )
         sql = " ".join(statement.text.lower().split())
 
@@ -141,6 +147,76 @@ class ForecastMapStatementTests(unittest.TestCase):
             },
         )
 
+    def test_latest_model_limits_candidates_to_latest_zone_generation(self):
+        statement, _ = _statement(
+            latest_model_only=True,
+            model_type="baseline",
+        )
+        sql = " ".join(statement.text.lower().split())
+
+        self.assertIn(
+            "select generation_candidate.generated_at",
+            sql,
+        )
+        self.assertIn(
+            "order by generation_candidate.generated_at desc limit 1",
+            sql,
+        )
+        self.assertEqual(
+            sql.count("f.generated_at = latest_generation.generated_at"),
+            2,
+        )
+        self.assertNotIn("group by", sql)
+
+
+class ForecastLatestGenerationQueryTests(unittest.TestCase):
+    def setUp(self):
+        engine = create_mock_engine(
+            "postgresql+psycopg2://",
+            lambda *args, **kwargs: None,
+        )
+        self.db = Session(bind=engine)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_uses_one_bounded_lateral_lookup_per_matching_zone(self):
+        query = forecasts._latest_generation_query(
+            db=self.db,
+            zone_id=9,
+            camera_id=3,
+            partner_id=4,
+            model_type="baseline",
+            generated_from=None,
+            generated_to=None,
+            from_=None,
+            to=None,
+            bbox=(34.3471, 61.78765, 34.36887, 61.79272),
+            is_active=True,
+        )
+        sql = " ".join(
+            str(
+                query.statement.compile(
+                    dialect=postgresql.dialect(),
+                    compile_kwargs={"literal_binds": True},
+                )
+            ).lower().split()
+        )
+
+        self.assertIn("join lateral", sql)
+        self.assertIn(
+            "order by generation_candidate.generated_at desc limit 1",
+            sql,
+        )
+        self.assertIn(
+            "forecasts.generated_at = latest_generation.generated_at",
+            sql,
+        )
+        self.assertIn("parking_zones.parking_zone_id = 9", sql)
+        self.assertIn("parking_zones.centroid_longitude >=", sql)
+        self.assertNotIn("group by", sql)
+        self.assertNotIn("row_number", sql)
+
 
 class _FakeMappings:
     def __init__(self, rows: list[dict[str, Any]]):
@@ -190,6 +266,7 @@ class ForecastMapExecutionTests(unittest.TestCase):
             to=None,
             bbox="34.3471,61.78765,34.36887,61.79272",
             is_active=True,
+            latest_model_only=False,
         )
 
         self.assertEqual(len(db.calls), 1)

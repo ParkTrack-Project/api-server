@@ -22,14 +22,14 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://swagger.parktrack.live",
-        "https://swagger.dev.parktrack.live",
-        "https://labeler.parktrack.live",
-        "https://admin.parktrack.live",
-        "https://parktrack.live",
-        "https://dev.parktrack.live",
-        "https://admin.dev.parktrack.live",
-        "https://m.parktrack.live",
+        "https://swagger.parktrack.app",
+        "https://swagger.dev.parktrack.app",
+        "https://labeler.parktrack.app",
+        "https://admin.parktrack.app",
+        "https://parktrack.app",
+        "https://dev.parktrack.app",
+        "https://admin.dev.parktrack.app",
+        "https://m.parktrack.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173"
     ],
